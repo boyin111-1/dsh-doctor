@@ -126,12 +126,19 @@ function readDeps(profileDir) {
 	}
 }
 
-/** 读依赖入口文件（package.json main 或 index.js） */
+/** 读依赖入口文件（exports["."] → main → index.js） */
 function entryFile(pkgDir) {
 	try {
 		const pkg = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf-8"));
-		const main = pkg.main || "index.js";
-		return join(pkgDir, main);
+		// exports["."] 优先（可以是字符串或条件对象）
+		const dot = pkg.exports && pkg.exports["."];
+		if (typeof dot === "string") return join(pkgDir, dot);
+		if (dot && typeof dot === "object") {
+			const cond = dot.import ?? dot.default ?? dot.require;
+			if (typeof cond === "string") return join(pkgDir, cond);
+		}
+		if (pkg.main) return join(pkgDir, pkg.main);
+		return join(pkgDir, "index.js");
 	} catch {
 		return null;
 	}
