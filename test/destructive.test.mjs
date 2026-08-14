@@ -62,15 +62,18 @@ function writeProfile(home, name, { deps = {}, bundles = [], patch = null, local
 
 /** 跑 dsh-doctor。dsh-doctor 在发现 ✗ 时会以非零码退出，这里把它接住并返回输出。 */
 function run(home) {
+	return runWith(doctor, [], { DSH_HOME: home });
+}
+/** 带参数/环境的 dsh-doctor 运行封装。 */
+function runWith(bin, args, envExtra = {}) {
 	try {
-		const out = execFileSync(process.execPath, [doctor], {
-			env: { ...process.env, DSH_HOME: home },
+		const out = execFileSync(process.execPath, [bin, ...args], {
+			env: { ...process.env, ...envExtra },
 			encoding: "utf-8",
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		return { code: 0, out };
 	} catch (e) {
-		// e.stdout / e.stderr 均为 Buffer|string；非零退出是预期（有 ✗）。
 		return { code: e.status ?? 1, out: String(e.stdout ?? "") + String(e.stderr ?? "") };
 	}
 }
@@ -189,6 +192,46 @@ console.log("\n== D9: --fix 自动重链 file: 依赖（用假 pnpm shim 记录�
 	rmSync(fh, { recursive: true, force: true });
 	rmSync(target, { recursive: true, force: true });
 	rmSync(bindir, { recursive: true, force: true });
+}
+
+console.log("\n== D10: --session 悬空 tool_call 检测（#1544/#1363）==");
+{
+	// 用一个单独的会话目录，feed 合成 JSONL 让 `--session` 检。
+	// zstd 存在才能测 zstd 路径；否则合成明文 .jsonl（工具二者都支持）。
+	const sh = makeHome();
+	const cdir = mkdirSync(join(sh, "sessions"), { recursive: true });
+	const base = (turn, step, callId, type) =>
+		JSON.stringify({ type, seq: turn * 100 + step, time: 1, data: {
+			turn, step, callId, name: "bash",
+			...(type === "tool/result" ? { message: { source: { kind: "tool", callId } } } : {}),
+		} });
+	// 构造真正未配对：call_orphan 只有 call 没有 result，且该 call 不在最新回合（turn2 已有 result）
+	const badLines = [
+		base(1, 1, "call_ok_1", "tool/call"),
+		base(1, 1, "call_ok_1", "tool/result"),
+		base(1, 2, "call_orphan_9", "tool/call"),     // ← 悬空（后续回合已到 turn2）
+		base(1, 2, "call_orphan_9", "tool/call"),     // 二次 call 仍无 result
+		base(2, 1, "call_late", "tool/call"),
+		base(2, 1, "call_late", "tool/result"),
+	];
+	const badLog = join(cdir, "bad.jsonl");
+	writeFileSync(badLog, badLines.join("\n") + "\n");
+	const { out } = runWith(doctor, ["--session", badLog]);
+	assert(out.includes("悬空 tool_call: call_orphan_9"), "会话坏：报出已完成后回合的悬空 tool_call",
+		out.split("\n").filter((l) => l.includes("call_orphan")).join(" | "));
+
+	// (b) 好：所有 call 都有 result → 无悬空 ✓（无不误报）
+	const goodLog = join(cdir, "good.jsonl");
+	writeFileSync(goodLog, [
+		base(1, 1, "c1", "tool/call"), base(1, 1, "c1", "tool/result"),
+		base(1, 2, "c2", "tool/call"), base(1, 2, "c2", "tool/result"),
+		base(2, 1, "c3", "tool/call"), base(2, 1, "c3", "tool/result"),
+	].join("\n") + "\n");
+	const { out: out2 } = runWith(doctor, ["--session", goodLog]);
+	assert(out2.includes("无悬空 tool_call"), "会话好：全绿无不误报",
+		out2.split("\n").filter((l) => l.includes("悬空")).join(" | ") || "");
+
+	rmSync(sh, { recursive: true, force: true });
 }
 
 console.log("\n== GOOD: 健康 profile（应全绿，无误报）==");

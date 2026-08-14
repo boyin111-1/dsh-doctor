@@ -32,6 +32,7 @@ const profilesRoot = join(dshHome, "profiles");
 const args = process.argv.slice(2);
 const onlyProfile = args.includes("--profile") ? args[args.indexOf("--profile") + 1] : null;
 const fixMode = args.includes("--fix");
+const sessionArg = args.includes("--session") ? args[args.indexOf("--session") + 1] : null;
 
 let pass = 0, fail = 0, warn = 0;
 const fixableFileLinks = []; // { profileDir, name, target }
@@ -196,6 +197,76 @@ function extractInsertIds(ymlPath) {
 	} catch {
 		return [];
 	}
+}
+
+/**
+ * 部署 zstd 解码会话日志（`session.jsonl.zstd`）。找不到 zstd 时返回 null（降级跳过）。
+ */
+function zstdDecode(filePath) {
+	try {
+		return execSync(`zstd -dc ${JSON.stringify(filePath)}`, { encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 });
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * 扫描会话日志里的“悬空 tool_call”——覆盖 #1544/#1363：
+ * 工具执行崩溃时未写入对应 `tool/result`，会话历史残留带 tool_calls 却无
+ * tool 结果的消息 → 后续每个请求都被 API 以 400 insufficient tool messages 拒绝。
+ *
+ * 配对键对齐源码：
+ *   packages/core/session/src/types.ts:279 `tool/call` 携带 `callId`
+ *   packages/core/session/src/types.ts:291 `tool/result` 的 `message.source.callId`
+ *   （tools/src/index.ts:315 ToolResultMessage.callId）
+ * 孤儿判定：某 callId 在 tool/call 中出现的次数 > 在 tool/result 中匹配的次数。
+ *
+ * @param sessionPath - `session.jsonl.zstd` 文件路径。
+ * @param display - 会话显示名。
+ */
+function checkSessionOrphanToolCalls(sessionPath, display) {
+	const raw = /\.zstd$/.test(sessionPath) ? zstdDecode(sessionPath) : (existsSync(sessionPath) ? readFileSync(sessionPath, "utf-8") : null);
+	if (raw === null) {
+		report("⚠", `会话不可读/无 zstd: ${display}（跳过孤儿 tool_call 检查）`);
+		return;
+	}
+	const callCount = new Map();   // callId -> { count, turn }
+	const resultCount = new Map(); // callId -> 匹配次数
+	let maxResultTurn = -Infinity;
+	for (const line of raw.split("\n")) {
+		if (!line.trim()) continue;
+		let d;
+		try { d = JSON.parse(line); } catch { continue; }
+		const t = d.type;
+		const data = d.data ?? {};
+		if (t === "tool/call" && typeof data.callId === "string") {
+			const prev = callCount.get(data.callId) ?? { count: 0, turn: data.turn };
+			callCount.set(data.callId, { count: prev.count + 1, turn: data.turn });
+		} else if (t === "tool/result") {
+			const m = data.message ?? {};
+			if (Number.isFinite(data.turn)) maxResultTurn = Math.max(maxResultTurn, data.turn);
+			const cid = (m.source ?? {}).callId;
+			if (typeof cid === "string") {
+				resultCount.set(cid, (resultCount.get(cid) ?? 0) + 1);
+			}
+		}
+	}
+	let orphans = 0;
+	for (const [cid, { count: calls, turn }] of callCount) {
+		const results = resultCount.get(cid) ?? 0;
+		if (calls <= results) continue;
+		// 若该 tool/call 落在尚未产出过任何 tool/result 的最新回合（可能是
+		// 仍在运行的会话的 in-flight 调用），只警告不判死；已完成的旧回合里
+		// 残留才是真正的悬空（#1544 会污染后续每个请求）。
+		if (turn >= maxResultTurn) {
+			orphans++;
+			report("⚠", `可能 in-flight tool_call: ${cid}（turn=${turn} 是目前最新活动回合 —— 若会话已结束才算悬空，#1544）`);
+			continue;
+		}
+		orphans++;
+		report("✗", `悬空 tool_call: ${cid}（${calls} 次 tool/call 仅 ${results} 次 tool/result，且位于已完成的较旧回合 —— 会话 ${display} 后续回合会被 400 insufficient tool messages 拒绝，#1544/#1363）`);
+	}
+	if (orphans === 0) report("✓", `无悬空 tool_call: ${display}`);
 }
 
 /** 检测 dsh.profile.bundles 完整性（#917/#880/#1197 族；advisory 分辨率锚点）。 */
@@ -400,6 +471,20 @@ function checkProfile(dir) {
 
 // ---- main ----
 console.log(`🔍 dsh-doctor — 检查 ${profilesRoot}`);
+
+// --session 模式：扫单个会话文件（#1544/#1363 悬空 tool_call）
+if (sessionArg) {
+	const sp = sessionArg;
+	if (!existsSync(sp)) {
+		console.log(`✗ 会话文件不存在: ${sp}`);
+		process.exit(1);
+	}
+	console.log("\n📼 session: " + sp);
+	checkSessionOrphanToolCalls(sp, sp.split("/").pop().replace(/\.jsonl\.zstd$/, "").slice(-24));
+	console.log(`\n========== 结果: ${pass} ✓ / ${warn} ⚠ / ${fail} ✗ ==========`);
+	process.exit(fail > 0 ? 1 : 0);
+}
+
 if (!existsSync(profilesRoot)) {
 	console.log("✗ 未找到 .dsh/profiles 目录");
 	process.exit(1);

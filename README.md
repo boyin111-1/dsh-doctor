@@ -28,6 +28,7 @@ node dsh-doctor/dsh-doctor.mjs
 ```bash
 dsh-doctor                # check all profiles
 dsh-doctor --profile web  # check only the web profile
+dsh-doctor --session <log># scan one session log (.jsonl.zstd / .jsonl) for dangling tool_calls
 dsh-doctor --fix          # auto-relink file: deps whose target exists but is not linked
 DSH_HOME=/path dsh-doctor # point at a specific Harness home (default ~/.dsh)
 ```
@@ -48,12 +49,21 @@ to vet a profile before switching to it.
 | 6 | `dsh.profile.bundles` integrity | a bundle listed in `package.json` that can't resolve (dangling → permanent boot failure), declares no `dsh.bundle`, or whose patch file is missing | #917 |
 | 7 | Bundle ↔ user-patch id collision | a user `cordis.patch.yml` insert reuses a bundle's entry id → `duplicate loader entry id`; or a bundle is both in `dsh.profile.bundles` and inserted again by name (post-`reconcile` redundancy) | #1404, #1479 (advisory item a) |
 | 8 | Lockfile `file:` reference | `pnpm-lock.yaml` records a `file:` dep consistent with disk | #1197 |
+| 9 | Dangling `tool_call` (session) | a `tool/call` with no matching `tool/result` (by `message.source.callId`) in a completed turn → every later request rejected with `400 insufficient tool messages` | #1544, #1363 |
 
 Checks 6 & 7 mirror `packages/boot/app-boot/src/profile.ts` `resolveBundleDir`
 (two-anchor: install package first, then profile dir) and the bundle-manifest
 contract (`dsh.bundle.patch`), so their conclusions match what real boot would
 throw. They directly implement the `dsh doctor` spec (a)+(b) proposed in
 [#1496](https://github.com/deepseek-ai/deepseek-harness/discussions/1496).
+
+Check 9 pairs `tool/call` ids (`packages/core/session/src/types.ts:279`) against
+`tool/result` ids (`types.ts:291` `message.source.callId`; `tools/src/index.ts:315`).
+A call still unmatched **after** its turn has produced results is an orphan that
+poisons every subsequent request (#1544). A dangling call in the **latest still
+active** turn is reported as a warning (likely in-flight), not a hard error, so
+scanning a live session doesn't false-positive. Read side consumes zstd frames
+(`zstd -dc`) or plain JSONL.
 
 Resolution checks use `createRequire(<profile>/package.json)` — the **same resolution anchor** the loader uses (`cordis-plugin-loader` imports bare specifiers against `ctx.baseUrl`), so the diagnosis matches what boot would do.
 
@@ -82,7 +92,7 @@ one** — the no-false-positive guarantee behind the "real env is all green" che
 ```bash
 node --check dsh-doctor.mjs          # syntax
 node dsh-doctor.mjs                  # real ~/.dsh must be all green
-node test/destructive.test.mjs       # 10 destructive assertions
+node test/destructive.test.mjs       # 12 destructive assertions (incl. --session orphan check)
 ```
 
 ## Example

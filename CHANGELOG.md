@@ -2,6 +2,29 @@
 
 All notable changes to dsh-doctor. Format follows [Keep a Changelog](https://keepachangelog.com/), versions match the npm `version` field.
 
+## [0.3.0] - 2026-08-15
+
+### Added
+- **`--session <log>` — dangling-`tool_call` scan (check 9, #1544/#1363)**. Parses a
+  session log (`.jsonl.zstd` via `zstd -dc`, or plain `.jsonl`) and pairs every
+  `tool/call` id (`packages/core/session/src/types.ts:279`) against its
+  `tool/result` (`types.ts:291` `message.source.callId`; `tools/src/index.ts:315`).
+  A call whose turn has already produced results but is still unmatched is an
+  orphan: it poisons every later model request with
+  `400 insufficient tool messages` (#1544/#1363). A dangling call in the latest
+  still-active turn is downgraded to a warning (likely an in-flight tool), so
+  scanning a live session never false-positives a hard error.
+- **Destructive test D10** — a synthetic log with an orphaned call in a completed
+  turn is flagged `✗`; an identical log with the matching result is reported
+  clean (`✓`), locking in the no-false-positive guarantee for the session check.
+- Field in the numbered check table + README section for the `--session` mode.
+
+### Correctness (out of the loop: this check was added from forum feedback)
+- The dangling-`tool_call` symptom came straight from community report #1544
+  (and its #1363 sibling), demonstrating the "forum → task-1" feedback loop the
+  project runs on: a new offline-detectable failure class, confirmed against the
+  real session-event schema, turned into a tested check.
+
 ## [0.2.0] - 2026-08-15
 
 ### Added
