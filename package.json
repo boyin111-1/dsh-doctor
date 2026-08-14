@@ -1,0 +1,30 @@
+{
+  "name": "dsh-doctor",
+  "version": "0.1.0",
+  "description": "Pre-boot health check for DeepSeek Harness profiles: dangling plugin refs, broken file: links, duplicate entry ids, dual @deepseek-ai instances.",
+  "type": "module",
+  "bin": {
+    "dsh-doctor": "./dsh-doctor.mjs"
+  },
+  "files": [
+    "dsh-doctor.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "diagnostics",
+    "plugin",
+    "cordis",
+    "healthcheck"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/boyin111-1/dsh-doctor.git"
+  }
+}
