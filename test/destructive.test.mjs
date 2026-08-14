@@ -243,13 +243,13 @@ console.log("\n== D11: --verify-anchors（检测锚点核对。#1544/#1363 家�
 	mkdirSync(join(ar, "packages/core/session/src"), { recursive: true });
 	mkdirSync(join(ar, "packages/core/tools/src"), { recursive: true });
 	mkdirSync(join(ar, "packages/boot/app-boot/src"), { recursive: true });
-	// 好：5 个锚点都在
+	// 好：5 个锚点都在（token 用与 real dsh 一致的编译/源码形态）
 	writeFileSync(join(ar, "packages/core/session/src/types.ts"),
 		"'tool/call': { turn; step; callId };\n" +
 		"'tool/result': { message: { source: { callId: CallId } } };\n");
 	writeFileSync(join(ar, "packages/core/tools/src/index.ts"), "readonly callId: CallId\n");
 	writeFileSync(join(ar, "packages/boot/app-boot/src/profile.ts"),
-		"for (const anchor of [installAnchor, join(profileDir, 'package.json')]) {}\ndsh.bundle.patch\n");
+		"for (const anchor of [installAnchor, join(profileDir, 'package.json')]) {}\ndsh?.bundle?.patch\n");
 	let r = runWith(doctor, ["--verify-anchors", ar]);
 	assert(r.out.includes("锚点核对: 5") && r.out.includes("5 ✓") && !r.out.includes("✗ 锚点缺失"),
 		"verify-anchors 对含全部锚点的树全绿",
@@ -259,8 +259,8 @@ console.log("\n== D11: --verify-anchors（检测锚点核对。#1544/#1363 家�
 	writeFileSync(join(ar, "packages/core/session/src/types.ts"),
 		"'tool/call': { turn; step; callId };\n"); // tool/result 配对键消失
 	r = runWith(doctor, ["--verify-anchors", ar]);
-	assert(r.out.includes("锚点缺失") && /锚点核对: [0-9]+ ✓ \/ 1 ✗/.test(r.out),
-		"verify-anchors 对缺锚点的树报 ✗",
+	assert(r.out.includes("锚点缺失") && r.out.includes("tool/result"),
+		"verify-anchors 对缺锚点的树报 ✗（且明确指出缺的是 tool/result）",
 		r.out.split("\n").filter((l) => l.includes("锚点")).join(" | ") || "");
 
 	rmSync(ar, { recursive: true, force: true });

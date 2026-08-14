@@ -5,15 +5,25 @@ All notable changes to dsh-doctor. Format follows [Keep a Changelog](https://kee
 ## [0.3.1] - 2026-08-15
 
 ### Added
-- **`--verify-anchors <dshRepo>` (anti-rot guard)**. `dsh-doctor`'s checks
-  mirror specific calls in official dsh source; if upstream changes one of
-  those behaviors a check can silently mis-report. This mode greps the official
-  repo for the source-level tokens each check relies on (5 anchors:
-  `tool/call`.callId, `tool/result` `message.source.callId`,
-  `ToolResultMessage.callId`, bundle two-anchor install-first order in
-  `profile.ts:resolveBundleDir`, and the `dsh.bundle.patch` contract) and exits
-  1 if any vanished — so an upstream change surfaces immediately instead of
-  producing a stale verdict. Destructive test D11 covers the good/missing paths.
+- **`--verify-anchors` (anti-rot guard)**. `dsh-doctor`'s checks mirror specific
+  calls in dsh; if the version you run changes one of those behaviors a check can
+  silently mis-report. This mode greps the **installed** dsh (compiled
+  `node_modules` artifacts — what you actually run, not a source checkout) for the
+  tokens each check relies on (5 anchors: the `tool/call` and `tool/result` event
+  literals, `ToolResultMessage.callId`, the bundle two-anchor install-first order,
+  and the `dsh.bundle.patch` contract) and exits 1 if any vanished — so a behavior
+  change surfaces immediately instead of producing a stale verdict.
+
+### Changed
+- `--verify-anchors` now takes an **optional** dir. With no argument it checks the
+  locally installed dsh (via `$HOME/.nvm .../@deepseek-ai/dsh`); with an argument
+  it checks **only that dir** and **never falls back** to the local install. The
+  prior version required a source-repo path, which wrongly verified a build the
+  user wasn't running (npm users run compiled `lib/`, and the repo can be a
+  different version/patch). This closes that gap.
+- Destructive test D11 updated to the 5-anchor contract: a complete tree reports
+  `5 ✓`; one with `tool/result` removed reports that exact anchor missing. The
+  test also proves the explicit-dir mode is independent of the local install.
 
 ## [0.3.0] - 2026-08-15
 

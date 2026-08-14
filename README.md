@@ -30,7 +30,8 @@ dsh-doctor                # check all profiles
 dsh-doctor --profile web  # check only the web profile
 dsh-doctor --session <log># scan one session log (.jsonl.zstd / .jsonl) for dangling tool_calls
 dsh-doctor --fix          # auto-relink file: deps whose target exists but is not linked
-dsh-doctor --verify-anchors <dshRepo>  # confirm checks still match official dsh source
+dsh-doctor --verify-anchors           # confirm checks still match YOUR installed dsh
+dsh-doctor --verify-anchors <dir>     # ... or a specific dir (source checkout / install)
 DSH_HOME=/path dsh-doctor # point at a specific Harness home (default ~/.dsh)
 ```
 
@@ -66,22 +67,29 @@ active** turn is reported as a warning (likely in-flight), not a hard error, so
 scanning a live session doesn't false-positive. Read side consumes zstd frames
 (`zstd -dc`) or plain JSONL.
 
-## Staying aligned with official dsh (anti-rot)
+## Staying aligned with the dsh you actually run (anti-rot)
 
-`dsh-doctor`'s checks are written to mirror specific calls in official dsh
-source. If upstream changes one of those behaviors, a check can silently start
-mis-reporting. `--verify-anchors <dshRepo>` greps the official repo for the
-source-level tokens each check depends on and flags any that vanished, so you
-learn the moment a check is no longer against the real behavior:
+`dsh-doctor`'s checks are written to mirror specific calls in dsh. If the
+version you run changes one of those behaviors, a check can silently start
+mis-reporting. `--verify-anchors` greps the **installed** dsh — the compiled
+`node_modules` artifacts you actually run, not a source checkout — for the
+source-level tokens each check depends on, and flags any that vanished:
 
 ```bash
-node dsh-doctor.mjs --verify-anchors ~/src/deepseek-harness
+node dsh-doctor.mjs --verify-anchors          # checks YOUR installed dsh
+node dsh-doctor.mjs --verify-anchors <dir>    # checks a specific dir instead
 ```
 
-It currently verifies 5 anchors: `tool/call`.callId, `tool/result`
-`message.source.callId`, `ToolResultMessage.callId`, the bundle two-anchor
-(install-first) order in `profile.ts:resolveBundleDir`, and the
-`dsh.bundle.patch` manifest contract. Exit code is 1 when any anchor is missing.
+Why the compiled install and not the GitHub source: most people install the
+npm build (`lib/*.js`), which can differ from the source repo in version or
+patch level. Verifying a source repo checks a build the user isn't running;
+verifying the installed artifacts matches exactly what `dsh-doctor` resolves
+at check time. An explicit dir is checked **alone** (never falls back to the
+local install), so a deliberately broken tree is reported broken.
+
+It verifies 5 anchors: the `tool/call` and `tool/result` event literals,
+`ToolResultMessage.callId`, the bundle two-anchor (install-first) order, and
+the `dsh.bundle.patch` manifest contract. Exit code is 1 when any is missing.
 
 Resolution checks use `createRequire(<profile>/package.json)` — the **same resolution anchor** the loader uses (`cordis-plugin-loader` imports bare specifiers against `ctx.baseUrl`), so the diagnosis matches what boot would do.
 

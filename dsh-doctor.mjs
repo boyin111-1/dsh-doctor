@@ -35,7 +35,10 @@ const args = process.argv.slice(2);
 const onlyProfile = args.includes("--profile") ? args[args.indexOf("--profile") + 1] : null;
 const fixMode = args.includes("--fix");
 const sessionArg = args.includes("--session") ? args[args.indexOf("--session") + 1] : null;
-const verifyAnchorsDir = args.includes("--verify-anchors") ? args[args.indexOf("--verify-anchors") + 1] : null;
+const verifyAnchorsIdx = args.indexOf("--verify-anchors");
+const verifyAnchorsDir = verifyAnchorsIdx !== -1
+	? (args[verifyAnchorsIdx + 1] && !args[verifyAnchorsIdx + 1].startsWith("--") ? args[verifyAnchorsIdx + 1] : null)
+	: null;
 
 let pass = 0, fail = 0, warn = 0;
 const fixableFileLinks = []; // { profileDir, name, target }
@@ -472,11 +475,13 @@ function checkProfile(dir) {
 	checkBundleIdCollision(profileDir, installAnchor);
 }
 
-/** 深度扫描某目录下所有源码/编译文件是否包含某 token（含子目录）。 */
-function deepInspectContains(root, filenamePattern, token) {
+/** 深度扫描某目录下源码/编译文件是否包含某 token。fixed=true 用 grep -F（字面量，避免元字符转义坑）。 */
+function deepInspectContains(root, filenamePattern, token, fixed = false) {
+	const flavor = fixed ? "-rlF" : "-rlE";
+	const t = fixed ? token.replace(/\n/g, "\\n") : token;
 	try {
 		const out = execSync(
-			`grep -rlE "${token}" --include="${filenamePattern}" "${root}" 2>/dev/null | head -5`,
+			`grep ${flavor} --include="${filenamePattern}" "${t}" "${root}" 2>/dev/null | head -5`,
 			{ encoding: "utf-8" },
 		);
 		return out.trim().length > 0;
@@ -486,51 +491,113 @@ function deepInspectContains(root, filenamePattern, token) {
 }
 
 /**
- * `--verify-anchors <dshRepo>`：核对本工具的检测结论是否仍与官方 dsh 源码一致。
- * dsh-doctor 的每个检测都"对齐"官方源码里的某几处行为（entry-id 生成、tool/result
- * 配对键、bundle 双锚点顺序、dsh.bundle 契约、createRequire(profile) 锚点）。官方升级
- * 若改了这些行为，本工具会静默误报/漏报——这个模式在给出结论前先验证锚点还在不在。
- *
- * @param repoDir - deepseek-harness 仓库目录。
+ * 解析安装版 dsh 的某个子包目录（在 @deepseek-ai/dsh 的 node_modules 下）。
+ * npm 编译产物布局：@deepseek-ai/dsh/node_modules/@deepseek-ai/<pkg>。
  */
-function verifyAnchors(repoDir) {
-	if (!existsSync(join(repoDir, "package.json"))) {
-		console.log("✗ 不是 dsh 仓库目录（无 package.json）: " + repoDir);
-		process.exit(1);
+function installedSubPackage(installAnchor, pkg) {
+	if (!installAnchor) return null;
+	const base = dirname(installAnchor); // .../lib/node_modules/@deepseek-ai/dsh
+	for (const dir of [join(base, "node_modules", "@deepseek-ai", pkg), join(base, "node_modules", pkg)]) {
+		if (existsSync(dir)) return dir;
 	}
+	return null;
+}
+
+/**
+ * `--verify-anchors [<dir>]`：核对检测依赖的官方行为锚点是否仍与"用户实际安装的 dsh"
+ * 一致。默认用 `findInstallAnchor()` 定位到的本机 dsh 安装，并检查其**编译产物**（lib/*.js）
+ * ——因为 dsh-doctor 跑的时候就是解析这套 node_modules，源码与实际运行行为必须一致。
+ * 也可显式传一个目录（源码仓库或安装目录）作覆盖。
+ *
+ * 为什么查产物而非源码：他人通过 npm 装的是编译后的 lib/，与 github 源码可能版本/补丁
+ * 不一致；只看仓库源码等于验证了用户没在跑的那份。这里对齐"用户跑的版本"。
+ *
+ * @param dirArg - 可选；缺省为 findInstallAnchor() 得到的安装。
+ */
+function verifyAnchors(dirArg) {
+	// 1. 决定要核对的目标。**显式指定时只看该目录，绝不回退到本机安装**——
+	//    否则会让"故意删除锚点的测试目录"被本机 dsh 掩盖，验了个寂寞。
+	let installAnchor = null; // 仅缺省模式赋值
+	let targetDesc;
+	if (dirArg) {
+		if (!existsSync(dirArg)) {
+			console.log(`✗ 目录不存在: ${dirArg}`);
+			process.exit(1);
+		}
+		targetDesc = dirArg;
+	} else {
+		installAnchor = findInstallAnchor();
+		if (!installAnchor) {
+			console.log("✗ 找不到 dsh 安装；需显式传 `--verify-anchors <目录>`（dsh 安装或源码仓库）");
+			process.exit(1);
+		}
+		targetDesc = dirname(installAnchor);
+	}
+	console.log(`🔎 核对锚点于: ${targetDesc}` + (dirArg ? "（显式指定）" : "（本机 dsh 安装）"));
+
+	// 2. 定位各子包。显式模式只从显式目录解析；缺省模式读本机安装的编译产物。
+	const sessionDir = (dirArg != null
+		? [join(dirArg, "node_modules", "@deepseek-ai", "dsh-session"), join(dirArg, "packages/core/session")].find(existsSync)
+		: installedSubPackage(installAnchor, "dsh-session") ?? join(targetDesc, "node_modules", "@deepseek-ai", "dsh-session"));
+	const toolsDir = (dirArg != null
+		? [join(dirArg, "node_modules", "@deepseek-ai", "dsh-tools"), join(dirArg, "packages/core/tools")].find(existsSync)
+		: installedSubPackage(installAnchor, "dsh-tools") ?? join(targetDesc, "node_modules", "@deepseek-ai", "dsh-tools"));
+	const bootDir = (dirArg != null
+		? [join(dirArg, "node_modules", "@deepseek-ai", "dsh-app-boot"), join(dirArg, "packages/boot/app-boot")].find(existsSync)
+		: installedSubPackage(installAnchor, "dsh-app-boot") ?? join(targetDesc, "node_modules", "@deepseek-ai", "dsh-app-boot"));
+
+	// 3. 锚点：token 按"编译产物 / 源码"两版，扫描 lib(js) 与 src(ts) 两套模式
 	const anchors = [
 		{
-			name: "tool/call.callId 事件字段（session types.ts）",
-			token: "'tool/call'.*callId",
-			file: "*.ts", dir: join(repoDir, "packages/core/session/src"),
+			name: "tool/call 事件字面量（session 日志配对起点；types.js）",
+			tokenCompiled: `"tool/call"`, tokenSource: `'tool/call'`,
+			fileCompiled: "*.js", fileSource: "*.ts",
 		},
 		{
-			name: "tool/result.message.source.callId 配对键（session types.ts）",
-			token: "callId.*ToolResultMessage|source.*callId",
-			file: "*.ts", dir: join(repoDir, "packages/core/session/src"),
+			name: "tool/result 事件字面量（配对终点；types.js）",
+			tokenCompiled: `"tool/result"`, tokenSource: `'tool/result'`,
+			fileCompiled: "*.js", fileSource: "*.ts",
 		},
 		{
-			name: "ToolResultMessage.callId（tools/index.ts）",
-			token: "readonly callId: CallId",
-			file: "*.ts", dir: join(repoDir, "packages/core/tools/src"),
+			name: "ToolResultMessage 携带 callId（tools lib）",
+			tokenCompiled: `readonly callId`, tokenSource: `readonly callId: CallId`,
+			fileCompiled: "*.js", fileSource: "*.ts",
 		},
 		{
-			name: "bundle 双锚点顺序安装优先（profile.ts resolveBundleDir）",
-			// 特征：双锚点循环里先遍历安装锚点再 profile 目录
-			token: "for.*anchor of.*installAnchor",
-			file: "*.ts", dir: join(repoDir, "packages/boot/app-boot/src"),
+			name: "bundle 双锚点顺序·安装优先（boot profile 产物）",
+			tokenCompiled: `[installAnchor, join(profileDir`, tokenSource: `for (const anchor of [installAnchor`,
+			fileCompiled: "*.js", fileSource: "*.ts",
 		},
 		{
-			name: "dsh.bundle.patch 清单契约（profile.ts）",
-			token: "dsh.*bundle.*patch",
-			file: "*.ts", dir: join(repoDir, "packages/boot/app-boot/src"),
+			name: "dsh.bundle.patch 清单契约（boot profile 产物）",
+			tokenCompiled: `dsh?.bundle?.patch`, tokenSource: `dsh?.bundle?.patch`,
+			fileCompiled: "*.js", fileSource: "*.ts",
 		},
 	];
+
+	const whichDir = (dir, kind) =>
+		kind === "compiled" && existsSync(dir) ? dir
+			: kind === "source" && existsSync(dir) ? dir
+				: null;
+
 	let ok = 0, bad = 0;
 	for (const a of anchors) {
-		const found = deepInspectContains(a.dir, a.file, a.token);
-		if (found) { ok++; console.log(`  ✓ 锚点仍在: ${a.name}`); }
-		else { bad++; console.log(`  ✗ 锚点缺失（检测结论可能已脱锚）: ${a.name}\n    grep "${a.token}" 在 ${a.dir} 无匹配 —— 请人工核对对应检测是否仍对齐。`); }
+		// 四个（dir, kind）候选：boot/session/tools 下 lib 或 src
+		const candidates = [
+			[a, "session", sessionDir, "compiled"], [a, "session", sessionDir, "source"],
+			[a, "tools", toolsDir, "compiled"], [a, "tools", toolsDir, "source"],
+			[a, "boot", bootDir, "compiled"], [a, "boot", bootDir, "source"],
+		];
+		let found = false, where = "";
+		for (const [, , dir, kind] of candidates) {
+			if (!dir) continue;
+			const token = kind === "compiled" ? a.tokenCompiled : a.tokenSource;
+			const file = kind === "compiled" ? a.fileCompiled : a.fileSource;
+			// tokenSource 可能含元字符，统一用字面量匹配以免转义坑
+			if (deepInspectContains(dir, file, token, true)) { found = true; where = `${kind}:${dir}`; break; }
+		}
+		if (found) { ok++; console.log(`  ✓ 锚点仍在（${where}）: ${a.name}`); }
+		else { bad++; console.log(`  ✗ 锚点缺失: ${a.name}\n    在 session/tools/boot 的 lib 与 src 均未命中 —— 请人工核对对应检测是否仍对齐实际安装版本。`); }
 	}
 	console.log(`\n========== 锚点核对: ${ok} ✓ / ${bad} ✗ ==========`);
 	process.exit(bad > 0 ? 1 : 0);
@@ -538,9 +605,8 @@ function verifyAnchors(repoDir) {
 
 // ---- main ----
 
-// --verify-anchors：核对检测结论是否仍与官方 dsh 源码一致（先于任何 profile 检查）
-if (verifyAnchorsDir) {
-	console.log(`🔎 dsh-doctor — 核对源码锚点（${verifyAnchorsDir}）`);
+// --verify-anchors：核对检测结论是否仍与"用户实际安装的 dsh"一致（先于任何 profile 检查）
+if (verifyAnchorsIdx !== -1) {
 	verifyAnchors(verifyAnchorsDir);
 }
 
