@@ -8,12 +8,19 @@ dsh's plugin tree is "fragile by install": a single dangling reference, broken `
 
 This class of failure was consolidated in [dsh discussion #1496](https://github.com/deepseek-ai/deepseek-harness/discussions/1496) (Advisory: plugin-install path needs guardrails) from [#1404](https://github.com/deepseek-ai/deepseek-harness/discussions/1404), [#1197](https://github.com/deepseek-ai/deepseek-harness/discussions/1197), [#1486](https://github.com/deepseek-ai/deepseek-harness/discussions/1486), [#1415](https://github.com/deepseek-ai/deepseek-harness/discussions/1415), [#1413](https://github.com/deepseek-ai/deepseek-harness/discussions/1413). `dsh-doctor` is the offline check that advisory calls for.
 
-## Install
+## Install / run
+
+No npm publish needed — dsh users already have Node.js, so run it straight from GitHub:
 
 ```bash
-npm install -g dsh-doctor
-# or run without installing:
-npx dsh-doctor
+npx --yes github:boyin111-1/dsh-doctor
+```
+
+Or clone and run locally:
+
+```bash
+git clone https://github.com/boyin111-1/dsh-doctor
+node dsh-doctor/dsh-doctor.mjs
 ```
 
 ## Usage
