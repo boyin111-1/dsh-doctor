@@ -126,6 +126,16 @@ function readDeps(profileDir) {
 	}
 }
 
+/** 读依赖入口文件（package.json main 或 index.js） */
+function entryFile(pkgDir) {
+	try {
+		const pkg = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf-8"));
+		const main = pkg.main || "index.js";
+		return join(pkgDir, main);
+	} catch {
+		return null;
+	}
+}
 /** 检查 pnpm-lock.yaml 里的 file: 依赖是否存在 */
 function checkFileLinks(profileDir, pkgName) {
 	const lockPath = join(profileDir, "pnpm-lock.yaml");
@@ -171,7 +181,13 @@ function checkProfile(dir) {
 	for (const [name, spec] of Object.entries(deps)) {
 		const resolved = join(profileDir, "node_modules", ...name.split("/"));
 		if (existsSync(resolved)) {
-			report("✓", `依赖在位: ${name}`);
+			// 入口产物完整性检查（#917/ICCuse：包在但 lib/index.js 缺失也会 boot 崩溃）
+			const mainFile = entryFile(resolved);
+			if (mainFile && !existsSync(mainFile)) {
+				report("✗", `入口产物缺失: ${name} → ${mainFile.slice(-60)}（包在但入口文件不在，boot 会崩溃）`);
+			} else {
+				report("✓", `依赖在位: ${name}`);
+			}
 		} else if (spec.startsWith("file:")) {
 			const raw = spec.slice(5);
 			const target = raw.startsWith("/") ? raw : join(profileDir, raw);
