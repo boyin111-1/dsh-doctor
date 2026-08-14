@@ -1,14 +1,20 @@
 {
   "name": "dsh-doctor",
-  "version": "0.1.0",
-  "description": "Pre-boot health check for DeepSeek Harness profiles: dangling plugin refs, broken file: links, duplicate entry ids, dual @deepseek-ai instances.",
+  "version": "0.2.0",
+  "description": "Pre-boot health check for DeepSeek Harness profiles: dangling refs, broken file: links, duplicate ids, dual @deepseek-ai instances, bundle integrity & id collisions, plus --fix relink.",
   "type": "module",
   "bin": {
     "dsh-doctor": "./dsh-doctor.mjs"
   },
+  "scripts": {
+    "test": "node test/destructive.test.mjs",
+    "check": "node --check dsh-doctor.mjs && node test/destructive.test.mjs"
+  },
   "files": [
     "dsh-doctor.mjs",
+    "test/destructive.test.mjs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "keywords": [
