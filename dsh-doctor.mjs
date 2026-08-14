@@ -14,9 +14,11 @@
  *   node dsh-doctor.mjs            # 检查全部 profile
  *   node dsh-doctor.mjs --profile web   # 只查 web
  *   node dsh-doctor.mjs --fix      # 自动重链 file: 依赖（target 存在但未链接）
+ *   node dsh-doctor.mjs --session <log>     # 扫会话日志里的悬空 tool_call（#1544/#1363）
+ *   node dsh-doctor.mjs --verify-anchors <dshRepo>  # 核对检测锚点是否仍与官方源码一致
  *   DSH_HOME=/path dsh-doctor.mjs  # 指定 Harness home（默认 ~/.dsh）
  *   node dsh-doctor.mjs 检查项 ≥9 类：悬空引用 / file:链接 / 重复id /
- *      入口产物 / 双实例 / bundles完整性 / bundle-id碰撞 / bundle冗余insert
+ *      入口产物 / 双实例 / bundles完整性 / bundle-id碰撞 / bundle冗余insert / 会话孤儿tool_call
  */
 
 import { createRequire } from "node:module";
@@ -33,6 +35,7 @@ const args = process.argv.slice(2);
 const onlyProfile = args.includes("--profile") ? args[args.indexOf("--profile") + 1] : null;
 const fixMode = args.includes("--fix");
 const sessionArg = args.includes("--session") ? args[args.indexOf("--session") + 1] : null;
+const verifyAnchorsDir = args.includes("--verify-anchors") ? args[args.indexOf("--verify-anchors") + 1] : null;
 
 let pass = 0, fail = 0, warn = 0;
 const fixableFileLinks = []; // { profileDir, name, target }
@@ -469,8 +472,77 @@ function checkProfile(dir) {
 	checkBundleIdCollision(profileDir, installAnchor);
 }
 
+/** 深度扫描某目录下所有源码/编译文件是否包含某 token（含子目录）。 */
+function deepInspectContains(root, filenamePattern, token) {
+	try {
+		const out = execSync(
+			`grep -rlE "${token}" --include="${filenamePattern}" "${root}" 2>/dev/null | head -5`,
+			{ encoding: "utf-8" },
+		);
+		return out.trim().length > 0;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * `--verify-anchors <dshRepo>`：核对本工具的检测结论是否仍与官方 dsh 源码一致。
+ * dsh-doctor 的每个检测都"对齐"官方源码里的某几处行为（entry-id 生成、tool/result
+ * 配对键、bundle 双锚点顺序、dsh.bundle 契约、createRequire(profile) 锚点）。官方升级
+ * 若改了这些行为，本工具会静默误报/漏报——这个模式在给出结论前先验证锚点还在不在。
+ *
+ * @param repoDir - deepseek-harness 仓库目录。
+ */
+function verifyAnchors(repoDir) {
+	if (!existsSync(join(repoDir, "package.json"))) {
+		console.log("✗ 不是 dsh 仓库目录（无 package.json）: " + repoDir);
+		process.exit(1);
+	}
+	const anchors = [
+		{
+			name: "tool/call.callId 事件字段（session types.ts）",
+			token: "'tool/call'.*callId",
+			file: "*.ts", dir: join(repoDir, "packages/core/session/src"),
+		},
+		{
+			name: "tool/result.message.source.callId 配对键（session types.ts）",
+			token: "callId.*ToolResultMessage|source.*callId",
+			file: "*.ts", dir: join(repoDir, "packages/core/session/src"),
+		},
+		{
+			name: "ToolResultMessage.callId（tools/index.ts）",
+			token: "readonly callId: CallId",
+			file: "*.ts", dir: join(repoDir, "packages/core/tools/src"),
+		},
+		{
+			name: "bundle 双锚点顺序安装优先（profile.ts resolveBundleDir）",
+			// 特征：双锚点循环里先遍历安装锚点再 profile 目录
+			token: "for.*anchor of.*installAnchor",
+			file: "*.ts", dir: join(repoDir, "packages/boot/app-boot/src"),
+		},
+		{
+			name: "dsh.bundle.patch 清单契约（profile.ts）",
+			token: "dsh.*bundle.*patch",
+			file: "*.ts", dir: join(repoDir, "packages/boot/app-boot/src"),
+		},
+	];
+	let ok = 0, bad = 0;
+	for (const a of anchors) {
+		const found = deepInspectContains(a.dir, a.file, a.token);
+		if (found) { ok++; console.log(`  ✓ 锚点仍在: ${a.name}`); }
+		else { bad++; console.log(`  ✗ 锚点缺失（检测结论可能已脱锚）: ${a.name}\n    grep "${a.token}" 在 ${a.dir} 无匹配 —— 请人工核对对应检测是否仍对齐。`); }
+	}
+	console.log(`\n========== 锚点核对: ${ok} ✓ / ${bad} ✗ ==========`);
+	process.exit(bad > 0 ? 1 : 0);
+}
+
 // ---- main ----
-console.log(`🔍 dsh-doctor — 检查 ${profilesRoot}`);
+
+// --verify-anchors：核对检测结论是否仍与官方 dsh 源码一致（先于任何 profile 检查）
+if (verifyAnchorsDir) {
+	console.log(`🔎 dsh-doctor — 核对源码锚点（${verifyAnchorsDir}）`);
+	verifyAnchors(verifyAnchorsDir);
+}
 
 // --session 模式：扫单个会话文件（#1544/#1363 悬空 tool_call）
 if (sessionArg) {
@@ -479,11 +551,13 @@ if (sessionArg) {
 		console.log(`✗ 会话文件不存在: ${sp}`);
 		process.exit(1);
 	}
-	console.log("\n📼 session: " + sp);
+	console.log("📼 session: " + sp);
 	checkSessionOrphanToolCalls(sp, sp.split("/").pop().replace(/\.jsonl\.zstd$/, "").slice(-24));
 	console.log(`\n========== 结果: ${pass} ✓ / ${warn} ⚠ / ${fail} ✗ ==========`);
 	process.exit(fail > 0 ? 1 : 0);
 }
+
+console.log(`🔍 dsh-doctor — 检查 ${profilesRoot}`);
 
 if (!existsSync(profilesRoot)) {
 	console.log("✗ 未找到 .dsh/profiles 目录");

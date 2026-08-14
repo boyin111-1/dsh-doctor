@@ -2,6 +2,19 @@
 
 All notable changes to dsh-doctor. Format follows [Keep a Changelog](https://keepachangelog.com/), versions match the npm `version` field.
 
+## [0.3.1] - 2026-08-15
+
+### Added
+- **`--verify-anchors <dshRepo>` (anti-rot guard)**. `dsh-doctor`'s checks
+  mirror specific calls in official dsh source; if upstream changes one of
+  those behaviors a check can silently mis-report. This mode greps the official
+  repo for the source-level tokens each check relies on (5 anchors:
+  `tool/call`.callId, `tool/result` `message.source.callId`,
+  `ToolResultMessage.callId`, bundle two-anchor install-first order in
+  `profile.ts:resolveBundleDir`, and the `dsh.bundle.patch` contract) and exits
+  1 if any vanished — so an upstream change surfaces immediately instead of
+  producing a stale verdict. Destructive test D11 covers the good/missing paths.
+
 ## [0.3.0] - 2026-08-15
 
 ### Added

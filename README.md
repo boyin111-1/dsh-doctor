@@ -30,6 +30,7 @@ dsh-doctor                # check all profiles
 dsh-doctor --profile web  # check only the web profile
 dsh-doctor --session <log># scan one session log (.jsonl.zstd / .jsonl) for dangling tool_calls
 dsh-doctor --fix          # auto-relink file: deps whose target exists but is not linked
+dsh-doctor --verify-anchors <dshRepo>  # confirm checks still match official dsh source
 DSH_HOME=/path dsh-doctor # point at a specific Harness home (default ~/.dsh)
 ```
 
@@ -64,6 +65,23 @@ poisons every subsequent request (#1544). A dangling call in the **latest still
 active** turn is reported as a warning (likely in-flight), not a hard error, so
 scanning a live session doesn't false-positive. Read side consumes zstd frames
 (`zstd -dc`) or plain JSONL.
+
+## Staying aligned with official dsh (anti-rot)
+
+`dsh-doctor`'s checks are written to mirror specific calls in official dsh
+source. If upstream changes one of those behaviors, a check can silently start
+mis-reporting. `--verify-anchors <dshRepo>` greps the official repo for the
+source-level tokens each check depends on and flags any that vanished, so you
+learn the moment a check is no longer against the real behavior:
+
+```bash
+node dsh-doctor.mjs --verify-anchors ~/src/deepseek-harness
+```
+
+It currently verifies 5 anchors: `tool/call`.callId, `tool/result`
+`message.source.callId`, `ToolResultMessage.callId`, the bundle two-anchor
+(install-first) order in `profile.ts:resolveBundleDir`, and the
+`dsh.bundle.patch` manifest contract. Exit code is 1 when any anchor is missing.
 
 Resolution checks use `createRequire(<profile>/package.json)` — the **same resolution anchor** the loader uses (`cordis-plugin-loader` imports bare specifiers against `ctx.baseUrl`), so the diagnosis matches what boot would do.
 

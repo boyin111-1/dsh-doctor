@@ -234,6 +234,38 @@ console.log("\n== D10: --session 悬空 tool_call 检测（#1544/#1363）==");
 	rmSync(sh, { recursive: true, force: true });
 }
 
+console.log("\n== D11: --verify-anchors（检测锚点核对。#1544/#1363 家族更新）==");
+{
+	// 构造一个假的 dsh 仓库目录树，内含/缺省锚点 token，验证检测逻辑本身。
+	const ar = makeHome(); // 复用临时目录作为"仓库根"
+	// 构造 anchors 结构：packages/core/session/src、packages/core/tools/src、packages/boot/app-boot/src
+	writeFileSync(join(ar, "package.json"), "{}");
+	mkdirSync(join(ar, "packages/core/session/src"), { recursive: true });
+	mkdirSync(join(ar, "packages/core/tools/src"), { recursive: true });
+	mkdirSync(join(ar, "packages/boot/app-boot/src"), { recursive: true });
+	// 好：5 个锚点都在
+	writeFileSync(join(ar, "packages/core/session/src/types.ts"),
+		"'tool/call': { turn; step; callId };\n" +
+		"'tool/result': { message: { source: { callId: CallId } } };\n");
+	writeFileSync(join(ar, "packages/core/tools/src/index.ts"), "readonly callId: CallId\n");
+	writeFileSync(join(ar, "packages/boot/app-boot/src/profile.ts"),
+		"for (const anchor of [installAnchor, join(profileDir, 'package.json')]) {}\ndsh.bundle.patch\n");
+	let r = runWith(doctor, ["--verify-anchors", ar]);
+	assert(r.out.includes("锚点核对: 5") && r.out.includes("5 ✓") && !r.out.includes("✗ 锚点缺失"),
+		"verify-anchors 对含全部锚点的树全绿",
+		r.out.split("\n").filter((l) => l.includes("锚点")).join(" | ") || "");
+
+	// 坏：删掉 tool/result 配对键锚点 → 报 ✗ 缺锚
+	writeFileSync(join(ar, "packages/core/session/src/types.ts"),
+		"'tool/call': { turn; step; callId };\n"); // tool/result 配对键消失
+	r = runWith(doctor, ["--verify-anchors", ar]);
+	assert(r.out.includes("锚点缺失") && /锚点核对: [0-9]+ ✓ \/ 1 ✗/.test(r.out),
+		"verify-anchors 对缺锚点的树报 ✗",
+		r.out.split("\n").filter((l) => l.includes("锚点")).join(" | ") || "");
+
+	rmSync(ar, { recursive: true, force: true });
+}
+
 console.log("\n== GOOD: 健康 profile（应全绿，无误报）==");
 {
 	// 用独立的 DSH_HOME，避免其它坏 profile 污染断言
