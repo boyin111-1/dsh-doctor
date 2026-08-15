@@ -16,12 +16,20 @@
  *   node dsh-doctor.mjs --fix      # 自动重链 file: 依赖（target 存在但未链接）
  *   node dsh-doctor.mjs --session <log>     # 扫会话日志里的悬空 tool_call（#1544/#1363）
  *   node dsh-doctor.mjs --verify-anchors <dshRepo>  # 核对检测锚点是否仍与官方源码一致
+ *   node dsh-doctor.mjs --check-update      # 在线对比 npm registry 与本机 dsh 版本
  *   DSH_HOME=/path dsh-doctor.mjs  # 指定 Harness home（默认 ~/.dsh）
- *   node dsh-doctor.mjs 检查项 ≥17 类：悬空引用 / file:链接 / 重复id /
+ *   node dsh-doctor.mjs 检查项 ≥18 类：悬空引用 / file:链接 / 重复id /
  *      入口产物 / 双实例 / bundles完整性 / bundle-id碰撞 / bundle冗余insert /
  *      会话孤儿tool_call / TUI超宽行崩溃补丁 / toolkit-plugins持久化插件源码 /
  *      版本漂移(#1515) / 沙箱schannel TLS(#1789) / 会话seq完整性(#1497族) /
- *      skill frontmatter冒号(#1401) / 端口排除段(#1462) / PATH工具(#1270)
+ *      skill frontmatter冒号(#1401) / 端口排除段(#1462) / PATH工具(#1270) /
+ *      锚点基线(防漂移，自动)
+ *
+ * 防漂移设计（官方仓库改了 / 本地二进制更新了 / 本地与官方不一致）：
+ *   - 每次运行自动 checkAnchorBaseline()：本机 dsh 版本 vs ANCHOR_BASELINE_VERSION，
+ *     不一致立即扫描 5 个行为锚点；锚点缺失则明确宣告"检测逻辑已脱节"并列出受影响检查。
+ *   - --verify-anchors：手动深度核对（可传官方仓库目录）。
+ *   - --check-update：在线对比 npm registry 最新版。
  */
 
 import { createRequire } from "node:module";
@@ -29,6 +37,7 @@ import { existsSync, readFileSync, readdirSync, lstatSync, realpathSync, writeFi
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
+import { get as httpsGet } from "node:https";
 
 const dshHome = (process.env.DSH_HOME && process.env.DSH_HOME.trim())
 	? process.env.DSH_HOME.trim()
@@ -42,6 +51,55 @@ const verifyAnchorsIdx = args.indexOf("--verify-anchors");
 const verifyAnchorsDir = verifyAnchorsIdx !== -1
 	? (args[verifyAnchorsIdx + 1] && !args[verifyAnchorsIdx + 1].startsWith("--") ? args[verifyAnchorsIdx + 1] : null)
 	: null;
+const checkUpdateIdx = args.indexOf("--check-update");
+
+/**
+ * 检测锚点的**版本基准**：以下 ANCHORS 是围绕哪个 dsh 版本验证过的。
+ *
+ * 防漂移契约（对应"官方仓库改了 / 本地二进制更新了 / 本地与官方不一致"三类变化）：
+ *   1. 每次常规运行都自动跑 checkAnchorBaseline()：把本机安装的 dsh 版本与
+ *      此基线比较。版本一致 → 锚点可信；不一致 → 自动扫描锚点确认是否仍命中，
+ *      锚点缺失即说明检测逻辑已与当前 dsh 脱节（此时 #6/#7/#9/#14 等依赖锚点的
+ *      检查结论不可信，必须人工核对或更新本工具）。
+ *   2. `--verify-anchors` 是深度的手动核对（可用官方仓库目录覆盖）。
+ *   3. `--check-update` 在线对比 npm registry，回答"官方/本地谁新"。
+ *
+ * dsh 升级后应重新跑 `--verify-anchors` 确认锚点仍在；若缺失，本工具需随
+ * 官方源码同步更新锚点（或按新 token 修正检查逻辑），而不是继续用旧 token 静默运行。
+ */
+const ANCHOR_BASELINE_VERSION = "0.1.0-rc.6";
+const ANCHORS = [
+	{
+		name: "tool/call 事件字面量（session 日志配对起点；types.js）",
+		tokenCompiled: `"tool/call"`, tokenSource: `'tool/call'`,
+		fileCompiled: "*.js", fileSource: "*.ts",
+		dependsOn: ["#9 会话孤儿 tool_call", "#14 会话 seq 完整性"],
+	},
+	{
+		name: "tool/result 事件字面量（配对终点；types.js）",
+		tokenCompiled: `"tool/result"`, tokenSource: `'tool/result'`,
+		fileCompiled: "*.js", fileSource: "*.ts",
+		dependsOn: ["#9 会话孤儿 tool_call", "#14 会话 seq 完整性"],
+	},
+	{
+		name: "ToolResultMessage 携带 callId（tools lib）",
+		tokenCompiled: `readonly callId`, tokenSource: `readonly callId: CallId`,
+		fileCompiled: "*.js", fileSource: "*.ts",
+		dependsOn: ["#9 会话孤儿 tool_call（callId 配对键）"],
+	},
+	{
+		name: "bundle 双锚点顺序·安装优先（boot profile 产物）",
+		tokenCompiled: `[installAnchor, join(profileDir`, tokenSource: `for (const anchor of [installAnchor`,
+		fileCompiled: "*.js", fileSource: "*.ts",
+		dependsOn: ["#6 bundles 完整性", "#7 bundle↔patch id 碰撞"],
+	},
+	{
+		name: "dsh.bundle.patch 清单契约（boot profile 产物）",
+		tokenCompiled: `dsh?.bundle?.patch`, tokenSource: `dsh?.bundle?.patch`,
+		fileCompiled: "*.js", fileSource: "*.ts",
+		dependsOn: ["#6 bundles 完整性（patch 契约）"],
+	},
+];
 
 let pass = 0, fail = 0, warn = 0;
 const fixableFileLinks = []; // { profileDir, name, target }
@@ -939,6 +997,97 @@ function installedSubPackage(installAnchor, pkg) {
 }
 
 /**
+ * 定位并扫描锚点（共享实现：verifyAnchors CLI 与 checkAnchorBaseline 自动检查共用）。
+ *
+ * 返回 { targetDesc, sessionDir, toolsDir, bootDir, results }：
+ *   results = [{ name, ok, where, dependsOn }]；找不到安装时返回 null（调用方降级）。
+ * 不 process.exit —— 由调用方决定如何处理结果。
+ */
+function scanAnchors(dirArg) {
+	let installAnchor = null;
+	let targetDesc;
+	if (dirArg) {
+		if (!existsSync(dirArg)) return null;
+		targetDesc = dirArg;
+	} else {
+		installAnchor = findInstallAnchor();
+		if (!installAnchor) return null;
+		targetDesc = dirname(installAnchor);
+	}
+
+	const sessionDir = (dirArg != null
+		? [join(dirArg, "node_modules", "@deepseek-ai", "dsh-session"), join(dirArg, "packages/core/session")].find(existsSync)
+		: installedSubPackage(installAnchor, "dsh-session") ?? join(targetDesc, "node_modules", "@deepseek-ai", "dsh-session"));
+	const toolsDir = (dirArg != null
+		? [join(dirArg, "node_modules", "@deepseek-ai", "dsh-tools"), join(dirArg, "packages/core/tools")].find(existsSync)
+		: installedSubPackage(installAnchor, "dsh-tools") ?? join(targetDesc, "node_modules", "@deepseek-ai", "dsh-tools"));
+	const bootDir = (dirArg != null
+		? [join(dirArg, "node_modules", "@deepseek-ai", "dsh-app-boot"), join(dirArg, "packages/boot/app-boot")].find(existsSync)
+		: installedSubPackage(installAnchor, "dsh-app-boot") ?? join(targetDesc, "node_modules", "@deepseek-ai", "dsh-app-boot"));
+
+	const whichDir = (dir, kind) =>
+		kind === "compiled" && existsSync(dir) ? dir
+			: kind === "source" && existsSync(dir) ? dir
+				: null;
+
+	const results = [];
+	for (const a of ANCHORS) {
+		const candidates = [
+			[a, "session", sessionDir, "compiled"], [a, "session", sessionDir, "source"],
+			[a, "tools", toolsDir, "compiled"], [a, "tools", toolsDir, "source"],
+			[a, "boot", bootDir, "compiled"], [a, "boot", bootDir, "source"],
+		];
+		let found = false, where = "";
+		for (const [, , dir, kind] of candidates) {
+			if (!dir) continue;
+			const token = kind === "compiled" ? a.tokenCompiled : a.tokenSource;
+			const file = kind === "compiled" ? a.fileCompiled : a.fileSource;
+			if (deepInspectContains(dir, file, token, true)) { found = true; where = `${kind}:${dir}`; break; }
+		}
+		results.push({ name: a.name, ok: found, where, dependsOn: a.dependsOn });
+	}
+	return { targetDesc, sessionDir, toolsDir, bootDir, results };
+}
+
+/**
+ * 自动锚点基线检查（防漂移第 1 道闸，每次常规运行都跑）。
+ *
+ * 本机安装的 dsh 版本 vs ANCHOR_BASELINE_VERSION：
+ *   - 版本一致 → 锚点可信，✓；
+ *   - 版本不一致（本地更新了 / 与基线漂移）→ 立即自动扫描锚点：
+ *       锚点全在 → ⚠ 提示版本漂移但检测仍有效（建议核对官方是否改行为）；
+ *       锚点缺失 → ✗ 检测逻辑已与当前 dsh 脱节，列出受影响检查，要求人工核对。
+ *   找不到 dsh 安装 → ⚠ 跳过（无安装无从核对，不误报）。
+ */
+function checkAnchorBaseline() {
+	const installAnchor = findInstallAnchor();
+	if (!installAnchor) {
+		report("⚠", `锚点基线: 找不到 dsh 安装（跳过；可显式 --verify-anchors <目录>）`);
+		return;
+	}
+	let installedVer = "?";
+	try { installedVer = JSON.parse(readFileSync(installAnchor, "utf-8")).version ?? "?"; } catch { /* keep ? */ }
+	if (installedVer === ANCHOR_BASELINE_VERSION) {
+		report("✓", `锚点基线: 本机 dsh v${installedVer} == 基线（${ANCHORS.length} 个检测锚点可信）`);
+		return;
+	}
+	// 版本漂移 → 自动扫描锚点确认检测是否仍有效
+	report("⚠", `锚点基线: 本机 dsh v${installedVer} ≠ 基线 v${ANCHOR_BASELINE_VERSION}（官方可能已改行为）—— 自动核对 ${ANCHORS.length} 个锚点…`);
+	const scan = scanAnchors(null);
+	if (!scan) { report("⚠", `锚点基线: 自动核对无结果（子包目录不可解析），请 --verify-anchors 人工核对`); return; }
+	let bad = 0;
+	for (const r of scan.results) {
+		if (r.ok) { report("✓", `锚点仍在（${r.where}）: ${r.name}`); }
+		else { bad++; report("✗", `锚点缺失: ${r.name} —— 依赖它的检查 ${r.dependsOn.join("、")} 的结论已不可信`); }
+	}
+	if (bad > 0) {
+		report("✗", `锚点基线: ${bad}/${ANCHORS.length} 锚点缺失 —— 本工具检测逻辑已与当前 dsh 脱节；请人工核对官方源码并同步更新本工具，勿再依据 #6/#7/#9/#14 的旧结论`);
+	} else {
+		report("✓", `锚点基线: 版本漂移但 ${ANCHORS.length} 个锚点全部仍在，检测逻辑仍有效（建议确认官方版本间无行为变化）`);
+	}
+}
+
+/**
  * `--verify-anchors [<dir>]`：核对检测依赖的官方行为锚点是否仍与"用户实际安装的 dsh"
  * 一致。默认用 `findInstallAnchor()` 定位到的本机 dsh 安装，并检查其**编译产物**（lib/*.js）
  * ——因为 dsh-doctor 跑的时候就是解析这套 node_modules，源码与实际运行行为必须一致。
@@ -952,7 +1101,6 @@ function installedSubPackage(installAnchor, pkg) {
 function verifyAnchors(dirArg) {
 	// 1. 决定要核对的目标。**显式指定时只看该目录，绝不回退到本机安装**——
 	//    否则会让"故意删除锚点的测试目录"被本机 dsh 掩盖，验了个寂寞。
-	let installAnchor = null; // 仅缺省模式赋值
 	let targetDesc;
 	if (dirArg) {
 		if (!existsSync(dirArg)) {
@@ -961,7 +1109,7 @@ function verifyAnchors(dirArg) {
 		}
 		targetDesc = dirArg;
 	} else {
-		installAnchor = findInstallAnchor();
+		const installAnchor = findInstallAnchor();
 		if (!installAnchor) {
 			console.log("✗ 找不到 dsh 安装；需显式传 `--verify-anchors <目录>`（dsh 安装或源码仓库）");
 			process.exit(1);
@@ -970,72 +1118,90 @@ function verifyAnchors(dirArg) {
 	}
 	console.log(`🔎 核对锚点于: ${targetDesc}` + (dirArg ? "（显式指定）" : "（本机 dsh 安装）"));
 
-	// 2. 定位各子包。显式模式只从显式目录解析；缺省模式读本机安装的编译产物。
-	const sessionDir = (dirArg != null
-		? [join(dirArg, "node_modules", "@deepseek-ai", "dsh-session"), join(dirArg, "packages/core/session")].find(existsSync)
-		: installedSubPackage(installAnchor, "dsh-session") ?? join(targetDesc, "node_modules", "@deepseek-ai", "dsh-session"));
-	const toolsDir = (dirArg != null
-		? [join(dirArg, "node_modules", "@deepseek-ai", "dsh-tools"), join(dirArg, "packages/core/tools")].find(existsSync)
-		: installedSubPackage(installAnchor, "dsh-tools") ?? join(targetDesc, "node_modules", "@deepseek-ai", "dsh-tools"));
-	const bootDir = (dirArg != null
-		? [join(dirArg, "node_modules", "@deepseek-ai", "dsh-app-boot"), join(dirArg, "packages/boot/app-boot")].find(existsSync)
-		: installedSubPackage(installAnchor, "dsh-app-boot") ?? join(targetDesc, "node_modules", "@deepseek-ai", "dsh-app-boot"));
-
-	// 3. 锚点：token 按"编译产物 / 源码"两版，扫描 lib(js) 与 src(ts) 两套模式
-	const anchors = [
-		{
-			name: "tool/call 事件字面量（session 日志配对起点；types.js）",
-			tokenCompiled: `"tool/call"`, tokenSource: `'tool/call'`,
-			fileCompiled: "*.js", fileSource: "*.ts",
-		},
-		{
-			name: "tool/result 事件字面量（配对终点；types.js）",
-			tokenCompiled: `"tool/result"`, tokenSource: `'tool/result'`,
-			fileCompiled: "*.js", fileSource: "*.ts",
-		},
-		{
-			name: "ToolResultMessage 携带 callId（tools lib）",
-			tokenCompiled: `readonly callId`, tokenSource: `readonly callId: CallId`,
-			fileCompiled: "*.js", fileSource: "*.ts",
-		},
-		{
-			name: "bundle 双锚点顺序·安装优先（boot profile 产物）",
-			tokenCompiled: `[installAnchor, join(profileDir`, tokenSource: `for (const anchor of [installAnchor`,
-			fileCompiled: "*.js", fileSource: "*.ts",
-		},
-		{
-			name: "dsh.bundle.patch 清单契约（boot profile 产物）",
-			tokenCompiled: `dsh?.bundle?.patch`, tokenSource: `dsh?.bundle?.patch`,
-			fileCompiled: "*.js", fileSource: "*.ts",
-		},
-	];
-
-	const whichDir = (dir, kind) =>
-		kind === "compiled" && existsSync(dir) ? dir
-			: kind === "source" && existsSync(dir) ? dir
-				: null;
-
+	// 2. 扫描锚点（共享实现）
+	const scan = scanAnchors(dirArg);
 	let ok = 0, bad = 0;
-	for (const a of anchors) {
-		// 四个（dir, kind）候选：boot/session/tools 下 lib 或 src
-		const candidates = [
-			[a, "session", sessionDir, "compiled"], [a, "session", sessionDir, "source"],
-			[a, "tools", toolsDir, "compiled"], [a, "tools", toolsDir, "source"],
-			[a, "boot", bootDir, "compiled"], [a, "boot", bootDir, "source"],
-		];
-		let found = false, where = "";
-		for (const [, , dir, kind] of candidates) {
-			if (!dir) continue;
-			const token = kind === "compiled" ? a.tokenCompiled : a.tokenSource;
-			const file = kind === "compiled" ? a.fileCompiled : a.fileSource;
-			// tokenSource 可能含元字符，统一用字面量匹配以免转义坑
-			if (deepInspectContains(dir, file, token, true)) { found = true; where = `${kind}:${dir}`; break; }
+	for (const r of scan.results) {
+		if (r.ok) { ok++; console.log(`  ✓ 锚点仍在（${r.where}）: ${r.name}`); }
+		else {
+			bad++;
+			console.log(`  ✗ 锚点缺失: ${r.name}\n    在 session/tools/boot 的 lib 与 src 均未命中 —— 依赖它的检查 ${r.dependsOn.join("、")} 的结论已不可信，请人工核对对应检测是否仍对齐实际安装版本。`);
 		}
-		if (found) { ok++; console.log(`  ✓ 锚点仍在（${where}）: ${a.name}`); }
-		else { bad++; console.log(`  ✗ 锚点缺失: ${a.name}\n    在 session/tools/boot 的 lib 与 src 均未命中 —— 请人工核对对应检测是否仍对齐实际安装版本。`); }
 	}
 	console.log(`\n========== 锚点核对: ${ok} ✓ / ${bad} ✗ ==========`);
+	console.log(`（基线版本 ${ANCHOR_BASELINE_VERSION}；若本机 dsh 已升级到其它版本，锚点缺失属预期，需同步更新本工具）`);
 	process.exit(bad > 0 ? 1 : 0);
+}
+
+/**
+ * `--check-update`：在线对比 npm registry 的 @deepseek-ai/dsh 最新版本与本机安装。
+ *
+ * 防漂移第 3 道闸：回答"本地二进制 vs 官方"谁新。npm registry 是官方发布渠道
+ * （比 GitHub master 更贴近用户实际会装的版本），零依赖（Node 18+ 内置 fetch）。
+ * 网络不可用 / registry 被墙时降级为提示，不视为失败。
+ *
+ * 输出：
+ *   - 本机 < 最新 → 提示可升级（附命令）；
+ *   - 本机 == 最新 → ✓ 已是最新（锚点基线若落后会在常规检查里另行提示）；
+ *   - 本机 > 最新（本地装过预发布/自建）→ 提示与官方版本漂移。
+ */
+async function checkUpdate() {
+	const anchor = findInstallAnchor();
+	const localVer = anchor
+		? (() => { try { return JSON.parse(readFileSync(anchor, "utf-8")).version ?? "?"; } catch { return "?"; } })()
+		: null;
+	console.log(`🔎 对比 @deepseek-ai/dsh：本机 ${localVer ?? "（未找到安装）"} vs npm registry …`);
+	// 用 node:https 而非 fetch：node:https 默认不 keep-alive，连接用完即关，
+	// process.exit 不会触发 Windows 上 fetch 的 UV_HANDLE_CLOSING 断言。
+	const latest = await new Promise((resolve) => {
+		const req = httpsGet("https://registry.npmjs.org/@deepseek-ai/dsh/latest", { timeout: 10000 }, (res) => {
+			let body = "";
+			res.on("data", (c) => (body += c));
+			res.on("end", () => {
+				try { resolve(JSON.parse(body).version); }
+				catch { resolve(null); }
+			});
+		});
+		req.on("timeout", () => { req.destroy(); resolve(null); });
+		req.on("error", () => resolve(null));
+	});
+	if (latest == null) {
+		console.log("  ⚠ 无法访问 npm registry —— 若浏览器能上 npm 而命令行不能，多半是代理/DNS 问题；不影响离线检查");
+		return;
+	}
+	if (!localVer) {
+		console.log(`  ✓ 官方最新: v${latest}（本机未发现安装，无从比较）`);
+		return;
+	}
+	const cmp = compareVersions(localVer, latest);
+	if (cmp < 0) {
+		console.log(`  ⚠ 本机 v${localVer} < 官方最新 v${latest} —— 建议升级: npm i -g @deepseek-ai/dsh@latest（升级后请跑 --verify-anchors 核对检测锚点）`);
+	} else if (cmp === 0) {
+		console.log(`  ✓ 本机 v${localVer} == 官方最新 v${latest}（已是最新）`);
+	} else {
+		console.log(`  ⚠ 本机 v${localVer} > 官方最新 v${latest}（本地装了官方未发布的预发布/自建版本，与官方仓库漂移；--verify-anchors 以本机安装为准）`);
+	}
+}
+
+/**
+ * 语义化版本比较（仅处理 doctor 场景：rc 预发布 vs 正式版，以及 x.y.z 数字段）。
+ * 返回 <0 / 0 / >0。预发布按"rc.N 低于同号正式版"处理：0.1.0-rc.6 < 0.1.0。
+ */
+function compareVersions(a, b) {
+	const parse = (v) => {
+		const m = String(v).trim().match(/^(\d+)\.(\d+)\.(\d+)(?:-(rc\.)?(\d+))?/);
+		if (!m) return null;
+		// 无 -rc 后缀 → 正式版，rc 段视为 +Infinity（任何 rc.N 都低于同号正式版）
+		return { major: +m[1], minor: +m[2], patch: +m[3], rc: m[4] ? +m[5] : Number.POSITIVE_INFINITY };
+	};
+	const pa = parse(a), pb = parse(b);
+	if (!pa || !pb) return String(a).localeCompare(String(b)); // 解析失败退回字符串比较
+	for (const k of ["major", "minor", "patch"]) {
+		if (pa[k] !== pb[k]) return pa[k] > pb[k] ? 1 : -1;
+	}
+	// 数字段全等：比较 rc（Infinity 表示正式版）
+	if (pa.rc === pb.rc) return 0;
+	return pa.rc > pb.rc ? 1 : -1;
 }
 
 // ---- main ----
@@ -1043,6 +1209,13 @@ function verifyAnchors(dirArg) {
 // --verify-anchors：核对检测结论是否仍与"用户实际安装的 dsh"一致（先于任何 profile 检查）
 if (verifyAnchorsIdx !== -1) {
 	verifyAnchors(verifyAnchorsDir);
+}
+
+// --check-update：在线对比 npm registry 最新版（防漂移第 3 道闸）。
+// node:https 连接用完即关，可直接 process.exit（无 fetch 的句柄残留问题）。
+if (checkUpdateIdx !== -1) {
+	await checkUpdate();
+	process.exit(0);
 }
 
 // --session 模式：扫单个会话文件（#1544/#1363 悬空 tool_call）
@@ -1074,6 +1247,9 @@ const profiles = readdirSync(profilesRoot)
 for (const p of profiles) checkProfile(join(profilesRoot, p));
 
 console.log("\n📌 全局检查（独立于 profile）");
+
+// 防漂移第 1 道闸：锚点基线（本机 dsh 版本 vs 锚点基线，不一致自动扫描）
+checkAnchorBaseline();
 
 // 额外：TUI profile 的超宽行崩溃补丁完整性（不属于 profile 清单检查，单独跑）
 checkTuiPatch();

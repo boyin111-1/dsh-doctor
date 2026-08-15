@@ -22,6 +22,8 @@
  *   T14 会话日志 seq 完整性（#1497/#1469 seq gap/重复/倒退）
  *   T15 skill frontmatter 冒号陷阱（#1401）
  *   T16 Windows 端口排除段（#1462）
+ *   T17 锚点基线防漂移（版本漂移自动核对：脱节/仍有效/一致三场景）
+ *   T18 --check-update（在线对比 npm registry，网络不可用降级）
  */
 import { execFileSync, execSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync, existsSync, readdirSync } from "node:fs";
@@ -559,6 +561,87 @@ console.log("\n== T16: Windows 端口排除段（#1462；非 Windows 自动跳�
 	} else {
 		console.log("  · 非 Windows，T16 自动跳过");
 	}
+}
+
+console.log("\n== T17: 锚点基线防漂移（版本漂移自动核对；本机一致不误报）==");
+{
+	// 构造假 dsh 安装树：<home>/lib/node_modules/@deepseek-ai/dsh + 子包，bin 放 <home>/bin
+	// 通过 PATH 注入让 findDshInstall 命中假安装（doctor 从 PATH 解析）。
+	const fakeDsh = (ver, anchorTokens) => {
+		const h = makeHome();
+		const dshRoot = join(h, "lib", "node_modules", "@deepseek-ai", "dsh");
+		const scoped = join(dshRoot, "node_modules", "@deepseek-ai");
+		mkdirSync(scoped, { recursive: true });
+		writeFileSync(join(dshRoot, "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh", version: ver }, null, 2) + "\n");
+		for (const [pkg, src] of Object.entries(anchorTokens)) {
+			const dir = join(scoped, pkg);
+			mkdirSync(join(dir, "lib"), { recursive: true });
+			mkdirSync(join(dir, "src"), { recursive: true });
+			writeFileSync(join(dir, "package.json"), JSON.stringify({ name: `@deepseek-ai/${pkg}`, version: ver, main: "lib/index.js" }, null, 2) + "\n");
+			writeFileSync(join(dir, "lib", "index.js"), src);
+			writeFileSync(join(dir, "src", "index.ts"), src);
+		}
+		const binDir = join(h, "bin");
+		mkdirSync(binDir, { recursive: true });
+		writeFileSync(join(binDir, "dsh"), "#!/usr/bin/env node\n");
+		writeProfile(h, "probe", {});
+		return { h, binDir };
+	};
+	const runWithPath = (h, binDir) => {
+		const sep = process.platform === "win32" ? ";" : ":";
+		return runWith(doctor, [], { DSH_HOME: h, PATH: binDir + sep + process.env.PATH });
+	};
+
+	// (a) 版本漂移（rc.7）+ 锚点缺失 → 自动核对报脱节，且列受影响检查
+	{
+		const { h, binDir } = fakeDsh("0.1.0-rc.7", {
+			"dsh-session": "// new build, old tokens removed\n",
+			"dsh-tools": "// new build\n",
+			"dsh-app-boot": "// new build\n",
+		});
+		const { out } = runWithPath(h, binDir);
+		assert(out.includes("≠ 基线 v0.1.0-rc.6"), "版本漂移 → 自动核对触发", out.split("\n").filter((l) => l.includes("锚点基线")).join(" | "));
+		assert(out.includes("5/5 锚点缺失") && out.includes("与当前 dsh 脱节"), "锚点全缺 → 宣告检测脱节", out.split("\n").filter((l) => l.includes("锚点")).join(" | "));
+		assert(out.includes("依赖它的检查"), "列出受影响检查", out.split("\n").filter((l) => l.includes("依赖它的检查")).join(" | ") || "");
+		rmSync(h, { recursive: true, force: true });
+	}
+
+	// (b) 版本漂移（rc.7）但锚点全在 → 提示仍有效，不误杀
+	{
+		const { h, binDir } = fakeDsh("0.1.0-rc.7", {
+			"dsh-session": `"tool/call"\n"tool/result"\n`,
+			"dsh-tools": "readonly callId: CallId\n",
+			"dsh-app-boot": "[installAnchor, join(profileDir, 'package.json')]\ndsh?.bundle?.patch\n",
+		});
+		const { out } = runWithPath(h, binDir);
+		assert(out.includes("版本漂移但 5 个锚点全部仍在"), "锚点全在 → 检测仍有效", out.split("\n").filter((l) => l.includes("锚点基线")).join(" | ") || "");
+		rmSync(h, { recursive: true, force: true });
+	}
+
+	// (c) 本机 == 基线（用真实安装，或假安装 rc.6 + 锚点全在）→ 不报漂移
+	{
+		const { h, binDir } = fakeDsh("0.1.0-rc.6", {
+			"dsh-session": `"tool/call"\n"tool/result"\n`,
+			"dsh-tools": "readonly callId: CallId\n",
+			"dsh-app-boot": "[installAnchor, join(profileDir, 'package.json')]\ndsh?.bundle?.patch\n",
+		});
+		const { out } = runWithPath(h, binDir);
+		assert(out.includes("本机 dsh v0.1.0-rc.6 == 基线"), "版本一致 → 锚点可信", out.split("\n").filter((l) => l.includes("锚点基线")).join(" | ") || "");
+		rmSync(h, { recursive: true, force: true });
+	}
+}
+
+console.log("\n== T18: --check-update（在线对比 npm registry；网络不可用自动降级）==");
+{
+	const th = makeHome();
+	writeProfile(th, "cu-probe", {});
+	const { out, code } = runWith(doctor, ["--check-update"], { DSH_HOME: th });
+	// 网络可用 → 输出本机/官方对比；不可用 → 降级提示。两者都不应崩溃。
+	assert(
+		out.includes("对比 @deepseek-ai/dsh") && (out.includes("官方最新") || out.includes("无法访问 npm registry")),
+		"--check-update 输出对比或降级提示", out.split("\n").filter((l) => l.includes("对比") || l.includes("官方") || l.includes("registry")).join(" | ") || "");
+	assert(code === 0, "--check-update 干净退出（code 0）", `code=${code}`);
+	rmSync(th, { recursive: true, force: true });
 }
 
 // 清理临时 home

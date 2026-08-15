@@ -32,6 +32,7 @@ dsh-doctor --session <log># scan one session log (.jsonl.zstd / .jsonl) for dang
 dsh-doctor --fix          # auto-relink file: deps whose target exists but is not linked
 dsh-doctor --verify-anchors           # confirm checks still match YOUR installed dsh
 dsh-doctor --verify-anchors <dir>     # ... or a specific dir (source checkout / install)
+dsh-doctor --check-update             # compare installed dsh vs npm registry latest
 DSH_HOME=/path dsh-doctor # point at a specific Harness home (default ~/.dsh)
 ```
 
@@ -104,29 +105,40 @@ npm-global-prefix layout (`<prefix>/node_modules/@deepseek-ai/dsh`, no `lib/`
 layer) in addition to the nvm layout — previously a dsh installed that way
 silently skipped the dual-instance and drift checks.
 
-## Staying aligned with the dsh you actually run (anti-rot)
+## Staying aligned when dsh changes (anti-rot, three gates)
 
-`dsh-doctor`'s checks are written to mirror specific calls in dsh. If the
-version you run changes one of those behaviors, a check can silently start
-mis-reporting. `--verify-anchors` greps the **installed** dsh — the compiled
-`node_modules` artifacts you actually run, not a source checkout — for the
-source-level tokens each check depends on, and flags any that vanished:
+`dsh-doctor`'s checks are written to mirror specific calls in dsh. When the
+official repo changes, your local binary is upgraded, or the two drift apart,
+the checks can silently start mis-reporting. Three gates keep that visible:
 
-```bash
-node dsh-doctor.mjs --verify-anchors          # checks YOUR installed dsh
-node dsh-doctor.mjs --verify-anchors <dir>    # checks a specific dir instead
-```
+1. **Automatic anchor-baseline gate (every run).** Every invocation compares
+   the installed dsh version against `ANCHOR_BASELINE_VERSION` (the release the
+   5 anchors were verified against). Matching → anchors trusted. Drifted →
+   the tool **immediately rescans the 5 anchors** in your installed build:
+   all present → "drift but still valid"; any missing → a hard error listing
+   exactly which anchors vanished and **which checks (#6/#7/#9/#14) now have
+   untrustworthy conclusions**, so you never rely on stale results after an
+   upgrade.
+2. **`--verify-anchors` (manual deep check).** Greps the **installed** dsh —
+   the compiled `node_modules` artifacts you actually run, not a source
+   checkout — for the source-level tokens each check depends on. Pass an
+   explicit directory (source repo or install) to check that alone.
+3. **`--check-update` (online).** Compares your installed dsh against the npm
+   registry latest (`@deepseek-ai/dsh`), answering "local vs official, who's
+   newer". Offline / registry-blocked degrades to a hint, never a failure.
+   Upgrading? Run `--verify-anchors` afterwards.
 
-Why the compiled install and not the GitHub source: most people install the
-npm build (`lib/*.js`), which can differ from the source repo in version or
-patch level. Verifying a source repo checks a build the user isn't running;
-verifying the installed artifacts matches exactly what `dsh-doctor` resolves
-at check time. An explicit dir is checked **alone** (never falls back to the
-local install), so a deliberately broken tree is reported broken.
+Same rationale as before: most people run the npm build (`lib/*.js`), which
+can differ from the source repo in version or patch level, so the baseline is
+verified against the **installed artifacts** — exactly what `dsh-doctor`
+resolves at check time.
 
 It verifies 5 anchors: the `tool/call` and `tool/result` event literals,
 `ToolResultMessage.callId`, the bundle two-anchor (install-first) order, and
 the `dsh.bundle.patch` manifest contract. Exit code is 1 when any is missing.
+
+An explicit `--verify-anchors <dir>` is checked **alone** (never falls back to
+the local install), so a deliberately broken tree is reported broken.
 
 Resolution checks use `createRequire(<profile>/package.json)` — the **same resolution anchor** the loader uses (`cordis-plugin-loader` imports bare specifiers against `ctx.baseUrl`), so the diagnosis matches what boot would do.
 
