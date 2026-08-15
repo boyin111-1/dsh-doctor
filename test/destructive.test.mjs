@@ -17,9 +17,9 @@
  *   D8 -> D9 bundle 冗余 insert（#1404 reconcile 未清理）
  */
 import { execFileSync, execSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -289,6 +289,62 @@ console.log("\n== GOOD: 健康 profile（应全绿，无误报）==");
 		`ℹ ${xl.concat(wl).map((s) => s.trim()).join(" | ") || "full green"}`);
 	rmSync(goodHome, { recursive: true, force: true });
 }
+
+	console.log("\n== D12: 双模块实例检测（#1486：同版本独立副本=工具层崩溃；symlink/非组件=正常）==");
+	{
+		// 需要 PATH 里能解析到真实 dsh 安装。若本机无 dsh，FindDualInstances 内部降级跳过，
+		// 本用例自动跳过（不做无效断言）。
+		const hasDsh = (() => {
+			try { const o = execSync("command -v dsh", { encoding: "utf-8" }).trim(); return o.length > 0; }
+			catch { return false; }
+		})();
+		if (hasDsh) {
+			// 通过 dsh 的 realpath bin 定位安装根（.../@deepseek-ai/dsh）
+			let installRoot = null;
+			{
+				const bin = execSync("command -v dsh", { encoding: "utf-8" }).trim();
+				let real = bin; try { real = realpathSync(bin); } catch {}
+				let d = dirname(real);
+				while (dirname(d) !== d) {
+					if (basename(d) === "dsh" && basename(dirname(d)) === "@deepseek-ai") { installRoot = d; break; }
+					const cand = join(d, "lib", "node_modules", "@deepseek-ai", "dsh");
+					if (existsSync(join(cand, "package.json"))) { installRoot = cand; break; }
+					d = dirname(d);
+				}
+			}
+			const installScoped = installRoot ? join(installRoot, "node_modules", "@deepseek-ai") : null;
+			if (installScoped && existsSync(installScoped) && readdirSync(installScoped).some((n) => n.startsWith("dsh-"))) {
+				const pkg = readdirSync(installScoped).find((n) => n.startsWith("dsh-") && existsSync(join(installScoped, n, "package.json")));
+				const installVer = JSON.parse(readFileSync(join(installScoped, pkg, "package.json"), "utf-8")).version;
+
+				// (a) 真目录独立副本（同版本）→ 应报双模块实例
+				const hA = makeHome();
+				const pA = writeProfile(hA, "dup-inst-a", {});
+				mkdirSync(join(pA, "node_modules", "@deepseek-ai", pkg), { recursive: true });
+				writeFileSync(join(pA, "node_modules", "@deepseek-ai", pkg, "package.json"),
+					JSON.stringify({ name: `@deepseek-ai/${pkg}`, version: installVer, main: "index.js" }, null, 2) + "\n");
+				writeFileSync(join(pA, "node_modules", "@deepseek-ai", pkg, "index.js"), "");
+				const { out: outA } = run(hA);
+				assert(outA.includes("双模块实例: @deepseek-ai/" + pkg), "同版本真目录独立副本→报双模块实例",
+					outA.split("\n").filter((l) => l.includes("双模块")).join(" | ") || "");
+				rmSync(hA, { recursive: true, force: true });
+
+				// (b) symlink 指向安装同一份（pnpm file: 正常形态）→ 应不报
+				const hB = makeHome();
+				const pB = writeProfile(hB, "dup-inst-b", {});
+				mkdirSync(join(pB, "node_modules", "@deepseek-ai"), { recursive: true });
+				symlinkSync(join(installScoped, pkg), join(pB, "node_modules", "@deepseek-ai", pkg), "dir");
+				const { out: outB } = run(hB);
+				assert(!outB.includes("双模块实例"), "symlink 指向安装同一份→不误报",
+					outB.split("\n").filter((l) => l.includes("双模块")).join(" | ") || "");
+				rmSync(hB, { recursive: true, force: true });
+			} else {
+				console.log("  · 本机 dsh 安装 scoped 目录不可用，双实例用例自动跳过");
+			}
+		} else {
+			console.log("  · 本机 PATH 无 dsh，双实例用例自动跳过");
+		}
+	}
 
 // 清理临时 home
 rmSync(home, { recursive: true, force: true });

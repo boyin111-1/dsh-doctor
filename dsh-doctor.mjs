@@ -22,8 +22,8 @@
  */
 
 import { createRequire } from "node:module";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, readFileSync, readdirSync, lstatSync, realpathSync } from "node:fs";
+import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
 
@@ -105,53 +105,106 @@ function checkDuplicateIds(profileDir) {
 	}
 }
 
-/** 检测双模块实例（覆盖 #1486：pnpm hoisting 导致两个 @deepseek-ai 实例） */
-function checkDualInstances(profileDir) {
-	const profileScoped = join(profileDir, "node_modules", "@deepseek-ai");
-	if (!existsSync(profileScoped)) return;
-	// dsh 安装目录（~/.nvm 下全局安装的 @deepseek-ai/dsh）
-	let installScoped = null;
-	try {
-		const out = execSync("ls -d $HOME/.nvm/versions/node/*/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai 2>/dev/null | head -1", { encoding: "utf-8" }).trim();
-		if (out) installScoped = out;
-	} catch { /* ignore */ }
-	if (!installScoped) return; // 找不到 dsh 安装目录，跳过双实例检查
-
-	const profilePkgs = existsSync(profileScoped) ? readdirSync(profileScoped) : [];
-	const installPkgs = existsSync(installScoped) ? readdirSync(installScoped) : [];
-	for (const pkg of profilePkgs) {
-		if (!installPkgs.includes(pkg)) continue;
-		// 两个位置都有同名 @deepseek-ai 包 → 可能双实例（hoisting 提升的副本）
-		const readVer = (dir) => {
-			try {
-				return JSON.parse(readFileSync(join(dir, pkg, "package.json"), "utf-8")).version;
-			} catch { return "?"; }
-		};
-		const profileVer = readVer(profileScoped);
-		const installVer = readVer(installScoped);
-		if (profileVer !== installVer) {
-			report("⚠", `可能双模块实例: @deepseek-ai/${pkg}（profile: v${profileVer} vs dsh 安装: v${installVer}）`);
-		}
-	}
-}
-
 /**
- * 定位 dsh 安装锚点（@deepseek-ai/dsh 的 package.json）。
- * 与 checkDualInstances 共用 ~/.nvm 全局安装布局；找不到则返回 null，
- * 相关检测自动降级为"跳过"而不是误报。
+ * 定位 dsh 安装根目录（@deepseek-ai/dsh 包根）。
+ *
+ * 优先从 PATH 解析：`which dsh` → realpath（展开 symlink）→ 向上逐段找
+ * `@deepseek-ai/dsh` 作为完整目录段，返回其父目录。这样 nvm / npm-global /
+ * pnpm-global / npx-cache / 自定义 prefix 等任意安装布局都能命中——修掉了
+ * 旧实现硬编码 `$HOME/.nvm/...` glob、导致其它安装方式下静默跳过的盲点。
+ *
+ * `dsh` 不在 PATH 时回退到常见全局布局 glob。返回 dsh 包根目录，找不到返回 null。
  */
-function findInstallAnchor() {
-	const dirs = [
-		"$HOME/.nvm/versions/node/*/lib/node_modules/@deepseek-ai/dsh/package.json",
-		"$HOME/.local/share/pnpm/global/5/node_modules/@deepseek-ai/dsh/package.json",
+function findDshInstall() {
+	try {
+		const bin = execSync("command -v dsh", { encoding: "utf-8" }).trim();
+		if (bin && (bin.startsWith("/") || bin.includes("/"))) {
+			let real = bin;
+			try { real = realpathSync(bin); } catch { /* keep symlink path */ }
+			let dir = dirname(real);
+			while (dirname(dir) !== dir) {
+				if (basename(dir) === "dsh" && basename(dirname(dir)) === "@deepseek-ai") {
+					// bin 直接就是 .../@deepseek-ai/dsh/bin/dsh 之类的布局 → 包根即 dir
+					return dir;
+				}
+				// 常见布局：.../lib/node_modules/@deepseek-ai/dsh/...
+				const cand = join(dir, "lib", "node_modules", "@deepseek-ai", "dsh");
+				if (existsSync(join(cand, "package.json"))) return cand;
+				dir = dirname(dir);
+			}
+		}
+	} catch { /* command -v failed */ }
+	const globs = [
+		"$HOME/.nvm/versions/node/*/lib/node_modules/@deepseek-ai/dsh",
+		"$HOME/.local/share/pnpm/global/*/node_modules/@deepseek-ai/dsh",
 	];
-	for (const glob of dirs) {
+	for (const g of globs) {
 		try {
-			const out = execSync(`ls ${glob} 2>/dev/null | head -1`, { encoding: "utf-8" }).trim();
+			const out = execSync(`ls -d ${g} 2>/dev/null | head -1`, { encoding: "utf-8" }).trim();
 			if (out) return out;
 		} catch { /* keep looking */ }
 	}
 	return null;
+}
+
+/**
+ * 定位 dsh 安装锚点（@deepseek-ai/dsh 的 package.json）。供 createRequire 解析。
+ * 基于 findDshInstall 的统一安装发现，不再硬编码安装布局。
+ */
+function findInstallAnchor() {
+	const root = findDshInstall();
+	if (!root) return null;
+	const a = join(root, "package.json");
+	return existsSync(a) ? a : null;
+}
+
+/** 检测双模块实例（覆盖 #1486：同一 @deepseek-ai 包出现两个独立副本并实例化）。
+ *
+ * 旧实现只在 profile 副本与 dsh 安装**版本不同**时才报，漏掉了 #1486 的核心
+ * 崩溃场景——同版本双副本（模块级 Symbol 不匹配）。且安装发现硬编码 ~/.nvm，
+ * npx/npm-global 下静默跳过。这里改为：
+ *  1. 从 PATH 统一发现 dsh 安装（findDshInstall）；
+ *  2. 版本无关：profile 顶层 node_modules/@deepseek-ai/<pkg> 只要是与安装不同
+ *     的**独立副本**就报（真目录 vs 指向安装的 symlink）——但仅限 dsh 运行时
+ *     组件（名以 `dsh-` 开头），排除 cosmokit/schemastery 这类共享基础库（它们
+ *     被 pnpm hoist 提升到顶层是正常、无模块级状态，重复无害）；
+ *  3. symlink 指向 dsh 安装同一份 → 单实例，不误报（与 pnpm file: 链接的正常形态一致）。
+ */
+function checkDualInstances(profileDir) {
+	const profileScoped = join(profileDir, "node_modules", "@deepseek-ai");
+	if (!existsSync(profileScoped)) return;
+	const installRoot = findDshInstall();
+	if (!installRoot) return; // 找不到 dsh 安装，跳过（降级，不误报）
+	// 安装侧的 @deepseek-ai scoped 目录
+	const installScoped = join(installRoot, "node_modules", "@deepseek-ai");
+	const installPkgs = existsSync(installScoped) ? new Set(readdirSync(installScoped)) : new Set();
+	if (installPkgs.size === 0) return;
+
+	readdirSync(profileScoped)
+		.filter((pkg) => pkg.startsWith("dsh-")) // 仅 dsh 运行时组件；cosmokit/schemastery 等共享库排除
+		.forEach((pkg) => {
+			const pdir = join(profileScoped, pkg);
+			let st;
+			try { st = lstatSync(pdir); } catch { return; }
+			// symlink → 解析真实路径；若指向 install 里的同一份 → 单实例，忽略
+			if (st.isSymbolicLink()) {
+				try {
+					const real = realpathSync(pdir);
+					const installPkgDir = join(installScoped, pkg);
+					if (real === realpathSync(installPkgDir)) return; // 同一份，正常
+				} catch { /* fall through: 无法解析则视为独立副本 */ }
+			}
+			// 独立副本（真目录或 symlink 指向别处）：若安装在同包名，构成双实例
+			if (!installPkgs.has(pkg)) return;
+			const readVer = (dir) => {
+				try { return JSON.parse(readFileSync(join(dir, pkg, "package.json"), "utf-8")).version; }
+				catch { return "?"; }
+			};
+			const profileVer = readVer(profileScoped);
+			const installVer = readVer(installScoped);
+			const verNote = profileVer !== installVer ? `（profile v${profileVer} vs 安装 v${installVer}）` : `（同版本 v${profileVer} —— 正是 #1486 的模块级 Symbol 崩溃场景）`;
+			report("✗", `双模块实例: @deepseek-ai/${pkg} 在 ${basename(profileDir)} 顶层有独立副本（非指向安装的链接）${verNote}——两个实例会各自持有模块级状态导致工具层崩溃（#1486）`);
+		});
 }
 
 /** 从 anchor（package.json 路径）解析包目录，镜像 profile.ts packageDirFromAnchor。 */

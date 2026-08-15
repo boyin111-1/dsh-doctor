@@ -2,6 +2,28 @@
 
 All notable changes to dsh-doctor. Format follows [Keep a Changelog](https://keepachangelog.com/), versions match the npm `version` field.
 
+## [0.3.2] - 2026-08-15
+
+### Fixed
+- **Dual-instance check now catches the same-version `#1486` crash.** `checkDualInstances`
+  previously only reported when a profile-hoisted `@deepseek-ai/*` copy's **version
+  differed** from the dsh install, so the exact `#1486` failure mode — two **identical-
+  version** module copies whose module-local `Symbol` mismatch crashes the tool layer —
+  slipped through green. It now flags an independent copy (a real directory, not a
+  symlink back to the install) **regardless of version**. Symlinked copies back to the
+  dsh install (the normal pnpm `file:` layout) are correctly treated as a single
+  instance, and shared libs (`cosmokit`/`schemastery`) are excluded so pnpm-hoisted
+  transitive deps don't false-positive.
+- **dsh install discovery no longer hard-codes `$HOME/.nvm`.** `findDshInstall`
+  resolves the real install from `command -v dsh` (realpath → walk up to the
+  `node_modules/@deepseek-ai/dsh` root), covering npx-cache / npm-global / custom
+  prefix layouts that the old `.nvm`/pnpm glob silently skipped. Existing glob fallback
+  retained for PATH-less shells.
+
+### Added
+- Destructive test D12: version-equal independent copy is reported; a symlink back to
+  the install is not (runtime component detection). Runs only when a `dsh` is on PATH.
+
 ## [0.3.1] - 2026-08-15
 
 ### Added

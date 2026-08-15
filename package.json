@@ -1,6 +1,6 @@
 {
   "name": "dsh-doctor",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Pre-boot health check for DeepSeek Harness profiles: dangling refs, broken file: links, duplicate ids, dual @deepseek-ai instances, bundle integrity & id collisions, plus --fix relink.",
   "type": "module",
   "bin": {

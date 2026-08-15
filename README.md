@@ -46,7 +46,7 @@ to vet a profile before switching to it.
 | 1 | Plugin resolution | dangling references unresolvable **from the profile dir** (the loader's real anchor) | #1197, #880 |
 | 2 | `file:` link integrity | dependencies whose `file:` target is missing / not linked in `node_modules` | #1197 |
 | 3 | Duplicate entry ids | same `id:` across/within `cordis*.yml` → `duplicate loader entry id` boot crash | #1404, #1479 |
-| 4 | Dual `@deepseek-ai` instances | profile-hoisted copies at different versions than the dsh install | #1486 |
+| 4 | Dual `@deepseek-ai` runtime instances | a `dsh-*` package with an **independent copy** (real dir, not a symlink back to the dsh install) hoisted at the profile's top-level `node_modules/@deepseek-ai/` — flagged **regardless of version** (version-equal copies are precisely the #1486 module-local `Symbol` crash); shared libs (`cosmokit`/`schemastery`) excluded | #1486 |
 | 5 | Entry artifacts | package present in `node_modules` but its `exports["."]/main` file is missing → boot hard-fails | #917, #1413 |
 | 6 | `dsh.profile.bundles` integrity | a bundle listed in `package.json` that can't resolve (dangling → permanent boot failure), declares no `dsh.bundle`, or whose patch file is missing | #917 |
 | 7 | Bundle ↔ user-patch id collision | a user `cordis.patch.yml` insert reuses a bundle's entry id → `duplicate loader entry id`; or a bundle is both in `dsh.profile.bundles` and inserted again by name (post-`reconcile` redundancy) | #1404, #1479 (advisory item a) |
