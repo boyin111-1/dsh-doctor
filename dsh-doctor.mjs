@@ -17,10 +17,11 @@
  *   node dsh-doctor.mjs --session <log>     # 扫会话日志里的悬空 tool_call（#1544/#1363）
  *   node dsh-doctor.mjs --verify-anchors <dshRepo>  # 核对检测锚点是否仍与官方源码一致
  *   DSH_HOME=/path dsh-doctor.mjs  # 指定 Harness home（默认 ~/.dsh）
- *   node dsh-doctor.mjs 检查项 ≥13 类：悬空引用 / file:链接 / 重复id /
+ *   node dsh-doctor.mjs 检查项 ≥17 类：悬空引用 / file:链接 / 重复id /
  *      入口产物 / 双实例 / bundles完整性 / bundle-id碰撞 / bundle冗余insert /
  *      会话孤儿tool_call / TUI超宽行崩溃补丁 / toolkit-plugins持久化插件源码 /
- *      版本漂移(#1515) / 沙箱schannel TLS(#1789)
+ *      版本漂移(#1515) / 沙箱schannel TLS(#1789) / 会话seq完整性(#1497族) /
+ *      skill frontmatter冒号(#1401) / 端口排除段(#1462) / PATH工具(#1270)
  */
 
 import { createRequire } from "node:module";
@@ -327,6 +328,127 @@ function checkSandboxTls() {
 	report("✓", `沙箱 TLS: ${tokenDesc} 下 curl HTTPS 返回 HTTP ${httpCode}（非 #1789 特征）`);
 }
 
+/**
+ * skill frontmatter 冒号检测（#1401/#1450/#936）。
+ *
+ * `~/.dsh/skills/<name>/SKILL.md`（以及 preset 的 skills/）frontmatter 里
+ * `description` 值若包含 ASCII "冒号+空格"（如 "Priority order: check ..."）
+ * 且未用引号包裹，parseFrontmatter 会抛 "Nested mappings are not allowed in
+ * compact mappings"，skill 被静默移除——catalog 完全不出现，仅后端 logger.warn。
+ *
+ * 本检查扫描 DSH_HOME/skills 与各 preset 的 skills 目录，找出未加引号且
+ * description 含 ASCII 冒号后随空格的 SKILL.md，提示加双引号包裹。
+ */
+function checkSkillFrontmatter() {
+	const roots = [join(dshHome, "skills")];
+	// preset 自带的 skills/（~/.dsh/.agent-presets/<id>/skills/）
+	try {
+		const presetsRoot = join(dshHome, ".agent-presets");
+		if (existsSync(presetsRoot)) {
+			for (const id of readdirSync(presetsRoot)) {
+				const p = join(presetsRoot, id, "skills");
+				if (existsSync(p)) roots.push(p);
+			}
+		}
+	} catch { /* ignore */ }
+	let scanned = 0, bad = 0;
+	for (const root of roots) {
+		if (!existsSync(root)) continue;
+		let entries;
+		try { entries = readdirSync(root); } catch { continue; }
+		for (const skillDir of entries) {
+			const md = join(root, skillDir, "SKILL.md");
+			if (!existsSync(md)) continue;
+			scanned++;
+			let src;
+			try { src = readFileSync(md, "utf8"); } catch { continue; }
+			// 只取 frontmatter（首个 --- 到第二个 ---）
+			const fm = src.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+			if (!fm) continue;
+			for (const line of fm[1].split(/\r?\n/)) {
+				const m = line.match(/^description:\s*(.+)$/);
+				if (!m) continue;
+				const val = m[1].trim();
+				// 已用引号包裹 → 安全
+				if (/^["'].*["']$/.test(val)) continue;
+				// ASCII 冒号+空格 → YAML compact mapping 解析炸弹
+				if (/:\s/.test(val)) {
+					bad++;
+					report("⚠", `skill frontmatter 冒号未加引号: ${md.replace(dshHome, "~")} — description 含 ": " 会被 YAML 误解析、skill 被静默丢弃（#1401/#936）；修复: description: "${val}"`);
+				}
+			}
+		}
+	}
+	if (scanned > 0 && bad === 0) report("✓", `skill frontmatter: ${scanned} 个 SKILL.md 无冒号陷阱（#1401）`);
+	else if (scanned === 0) report("✓", `skill frontmatter: 无 skills 目录可扫（跳过）`);
+}
+
+/**
+ * Windows 端口排除段检测（#1462：3080 落在 Hyper-V/WSL2 保留区间 → EACCES）。
+ *
+ * Windows 启用 Hyper-V/WSL2/Docker 后，系统会保留若干 TCP 端口段（如
+ * 3080–3179），任何进程（含管理员）都无法绑定 → dsh web 默认端口 3080
+ * 直接 EACCES 起不来。排除段每台机器不同，换固定端口也脆弱。
+ *
+ * 本检查解析 `netsh interface ipv4 show excludedportrange protocol=tcp`，
+ * 报告 3080 是否落在排除段内并给出 `--port` 建议。
+ */
+function checkExcludedPorts() {
+	if (process.platform !== "win32") return; // 仅 Windows 有 Hyper-V 保留端口
+	let out = "";
+	try {
+		out = execSync("netsh interface ipv4 show excludedportrange protocol=tcp", {
+			encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 10000,
+		});
+	} catch {
+		report("⚠", `端口排除段: netsh 不可用/超时（跳过 #1462 检查）`);
+		return;
+	}
+	const ranges = [];
+	for (const line of out.split(/\r?\n/)) {
+		const m = line.match(/^\s*(\d+)\s+(\d+)\s*$/);
+		if (m) ranges.push({ start: +m[1], end: +m[2] });
+	}
+	if (ranges.length === 0) { report("✓", `端口排除段: netsh 无输出（#1462 不适用）`); return; }
+	const PORT = 3080;
+	const hit = ranges.find((r) => PORT >= r.start && PORT <= r.end);
+	if (hit) {
+		report("✗", `端口 3080 在 Windows 排除段 ${hit.start}–${hit.end} 内（#1462）— dsh web 绑定将 EACCES；修复: dsh web --port 8080（或任一非排除端口），或 netsh int ipv4 add excludedportrange 调整保留段`);
+	} else {
+		report("✓", `端口 3080 不在 Windows 排除段内（当前 ${ranges.length} 段，最近 ${ranges.map((r) => `${r.start}-${r.end}`).slice(0, 3).join(", ")}…）`);
+	}
+}
+
+/**
+ * PATH 工具可用性检测（#1270/#1772：node/pnpm 不在 PATH → 新建会话静默失败 /
+ * npx 无法安装）。
+ *
+ * dsh 的 subprocess 后端用 `env node` 定位 node，node 不在 PATH 时新建会话
+ * 静默失败（web.err.log 刷 "env: node: No such file or directory"）；npx/npm
+ * 安装同理。本检查探测 node/pnpm/npm/zstd 是否可解析。
+ */
+function checkPathTools() {
+	const probe = (name) => {
+		try {
+			const cmd = process.platform === "win32" ? `where ${name}` : `command -v ${name}`;
+			const o = execSync(cmd, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+			return o.split(/\r?\n/)[0] || null;
+		} catch { return null; }
+	};
+	const nodePath = probe("node");
+	const pnpmPath = probe("pnpm");
+	const npmPath = probe("npm");
+	const zstdPath = probe("zstd");
+	if (nodePath) report("✓", `PATH node: ${nodePath}`);
+	else report("✗", `PATH node: 未找到 — dsh 新建会话会静默失败（#1270）；修复: 把 node 所在目录加入 PATH（版本管理器/自定义安装常见）`);
+	if (pnpmPath) report("✓", `PATH pnpm: ${pnpmPath}`);
+	else report("⚠", `PATH pnpm: 未找到（dsh 插件安装依赖 pnpm；npm 也可用）`);
+	if (npmPath) report("✓", `PATH npm: ${npmPath}`);
+	else report("⚠", `PATH npm: 未找到（npx 安装 dsh 依赖 npm）`);
+	if (zstdPath) report("✓", `PATH zstd: ${zstdPath}`);
+	else report("⚠", `PATH zstd: 未找到（会话日志 zstd 解码降级为明文；--session 检查仍可用）`);
+}
+
 /** 从 anchor（package.json 路径）解析包目录，镜像 profile.ts packageDirFromAnchor。 */
 function packageDirFromAnchor(anchor, packageName) {
 	try {
@@ -446,6 +568,55 @@ function checkSessionOrphanToolCalls(sessionPath, display) {
 		report("✗", `悬空 tool_call: ${cid}（${calls} 次 tool/call 仅 ${results} 次 tool/result，且位于已完成的较旧回合 —— 会话 ${display} 后续回合会被 400 insufficient tool messages 拒绝，#1544/#1363）`);
 	}
 	if (orphans === 0) report("✓", `无悬空 tool_call: ${display}`);
+}
+
+/**
+ * 会话日志 seq 完整性检测（#1497/#1469/#1586/#1452/#1433/#1333/#1305/#1287/#1299）。
+ *
+ * dsh 的 SessionLogScanner.consumeEventLine 要求每个事件的 `seq` 与它在日志中的
+ * 位置连续（expected === index）。社区里反复出现三类破坏：
+ *   - 非正常退出后重放已提交事件 → seq 倒退/重复（#1497/#1287）
+ *   - 强制压缩折叠事件但未重排后续 seq → seq gap（#1469）
+ *   - 多进程并发写同一会话 → seq 撞号（#1433/#1452/#1586）
+ * 任何一种都会让加载器报 `corrupt session log: seq gap in committed region`，
+ * 整段历史永久不可加载（#1047/#1473：单个坏日志还能让 session.list 整体 500）。
+ *
+ * 本检查只做只读扫描：解压 → 逐行核对 seq 连续性 → 报告具体行号与
+ * expected/got，帮助在打开会话前先判断日志是否已损坏、损坏在哪一行。
+ *
+ * @param sessionPath - `session.jsonl.zstd` / 明文 `.jsonl` 文件路径。
+ * @param display - 会话显示名。
+ */
+function checkSessionSeqIntegrity(sessionPath, display) {
+	const raw = /\.zstd$/.test(sessionPath) ? zstdDecode(sessionPath) : (existsSync(sessionPath) ? readFileSync(sessionPath, "utf-8") : null);
+	if (raw === null) {
+		report("⚠", `会话不可读/无 zstd: ${display}（跳过 seq 完整性检查）`);
+		return;
+	}
+	let expected = 0, line = 0, issues = 0, events = 0;
+	const gaps = [], dupes = [], rewind = [];
+	for (const l of raw.split("\n")) {
+		line++;
+		if (!l.trim()) continue;
+		let d;
+		try { d = JSON.parse(l); } catch { continue; }
+		const seq = d.seq;
+		if (!Number.isInteger(seq)) continue;
+		events++;
+		if (seq === expected) { expected++; continue; }
+		if (seq > expected) { gaps.push(`L${line} seq ${expected}→${seq}（缺 ${seq - expected}）`); expected = seq + 1; issues++; }
+		else if (seq === expected - 1) { /* 重复的旧 seq 也计问题 */ dupes.push(`L${line} seq ${seq} 重复`); issues++; }
+		else { rewind.push(`L${line} seq ${seq} 倒退（已见 ${expected - 1}）`); issues++; }
+	}
+	if (issues === 0) {
+		report("✓", `会话 seq 连续: ${display}（${events} 事件无 gap/重复）`);
+		return;
+	}
+	const MAX_SHOW = 4;
+	const show = (arr) => arr.slice(0, MAX_SHOW).join("; ") + (arr.length > MAX_SHOW ? ` …（共 ${arr.length} 处）` : "");
+	if (gaps.length) report("✗", `会话 seq 空洞: ${display} — ${show(gaps)}（#1469/#1497 压缩/崩溃后未重排 seq，加载器将报 corrupt session log）`);
+	if (dupes.length) report("✗", `会话 seq 重复: ${display} — ${show(dupes)}（#1497/#1287 崩溃重放已提交事件）`);
+	if (rewind.length) report("✗", `会话 seq 倒退: ${display} — ${show(rewind)}（#1433/#1452/#1586 并发写/重放导致 seq 撞号）`);
 }
 
 /** 检测 dsh.profile.bundles 完整性（#917/#880/#1197 族；advisory 分辨率锚点）。 */
@@ -621,7 +792,7 @@ function applyTuiPatch(file) {
 
 /** 检查一个 profile */
 function checkProfile(dir) {
-	const profileName = dir.split("/").pop();
+	const profileName = basename(dir); // Windows 路径用 \，split("/") 会返回整条路径
 	console.log(`\n📦 profile: ${profileName}`);
 	const profileDir = dir;
 
@@ -882,7 +1053,9 @@ if (sessionArg) {
 		process.exit(1);
 	}
 	console.log("📼 session: " + sp);
-	checkSessionOrphanToolCalls(sp, sp.split("/").pop().replace(/\.jsonl\.zstd$/, "").slice(-24));
+	const display = basename(sp).replace(/\.jsonl\.zstd$/, "").slice(-24);
+	checkSessionOrphanToolCalls(sp, display);
+	checkSessionSeqIntegrity(sp, display);
 	console.log(`\n========== 结果: ${pass} ✓ / ${warn} ⚠ / ${fail} ✗ ==========`);
 	process.exit(fail > 0 ? 1 : 0);
 }
@@ -900,11 +1073,22 @@ const profiles = readdirSync(profilesRoot)
 
 for (const p of profiles) checkProfile(join(profilesRoot, p));
 
+console.log("\n📌 全局检查（独立于 profile）");
+
 // 额外：TUI profile 的超宽行崩溃补丁完整性（不属于 profile 清单检查，单独跑）
 checkTuiPatch();
 
 // 额外：Windows 沙箱 schannel TLS 探测（#1789，独立于 profile）
 checkSandboxTls();
+
+// 额外：skill frontmatter 冒号陷阱（#1401/#936）
+checkSkillFrontmatter();
+
+// 额外：Windows 端口排除段（#1462，独立于 profile）
+checkExcludedPorts();
+
+// 额外：PATH 工具可用性（#1270/#1772）
+checkPathTools();
 
 console.log(`\n========== 结果: ${pass} ✓ / ${warn} ⚠ / ${fail} ✗ ==========`);
 

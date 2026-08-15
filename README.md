@@ -56,6 +56,10 @@ to vet a profile before switching to it.
 | 11 | `toolkit-plugins` persistence | `.mjs` global tools (host-composed) vs `host.js`/`client.js` dynamic-plugin sources (the `plugin_deploy` recovery prerequisite); an empty kit dir warns | — |
 | 12 | host ↔ profile `@deepseek-ai/*` version drift | a profile-top-level copy of a `dsh-*`/shared package whose version differs from the installed dsh → the module-local `TOOL_RUNTIME_SCHEDULER` Symbol mismatch that crashes **every** tool call with `Cannot read properties of undefined (reading 'prepare')` (or `cannot get property "tools" without inject` for shared libs); fix hint: delete the copy or `pnpm add @deepseek-ai/<pkg>@<installed>` | #1515 |
 | 13 | Windows sandbox schannel TLS | probes `curl.exe` HTTPS under the current token; `SEC_E_NO_CREDENTIALS (0x8009030e)` means the ACL-restricted token (workspace-write sandbox) breaks schannel — contradicting the sandbox doc's "network not restricted" claim; workaround: `danger-full-access` for network commands or a non-schannel client (Python/OpenSSL) | #1789 |
+| 14 | Session log `seq` integrity (`--session`) | `seq` gaps / duplicates / rewinds in `session.jsonl[.zstd]` — the exact corruptions the loader rejects with `corrupt session log: seq gap in committed region`, from unclean-exit replays, forced compaction, or concurrent writers; reports line numbers + expected/got | #1497, #1469, #1586, #1433, #1452, #1333, #1305, #1287 |
+| 15 | Skill frontmatter colon trap | `SKILL.md` frontmatter whose unquoted `description` contains ASCII `": "` → YAML parses it as a nested mapping, the skill is silently dropped from the catalog (only a `logger.warn`); scans `~/.dsh/skills` and preset `skills/`, suggests quoting | #1401, #1450, #936 |
+| 16 | Windows excluded port range | parses `netsh interface ipv4 show excludedportrange protocol=tcp`; flags when dsh's default port 3080 falls inside a Hyper-V/WSL2/Docker reserved band (bind fails with EACCES even as admin) and suggests `--port` | #1462 |
+| 17 | PATH tool availability | `node`/`pnpm`/`npm`/`zstd` resolvable from PATH — missing `node` silently breaks new-session creation (`env: node: No such file or directory`), missing `pnpm` breaks plugin install | #1270, #1772 |
 
 Checks 6 & 7 mirror `packages/boot/app-boot/src/profile.ts` `resolveBundleDir`
 (two-anchor: install package first, then profile dir) and the bundle-manifest
@@ -81,6 +85,19 @@ Check 13 surfaces [#1789](https://github.com/deepseek-ai/deepseek-harness/discus
 the ACL-restricted token from `dsh-sandbox-windows-acl` (`CreateRestrictedToken`,
 dwFlags=13) breaks schannel TLS on Windows, which contradicts the sandbox doc's
 "reads, network, and process visibility are NOT restricted".
+
+Check 14 mirrors the loader's own contiguity rule
+(`packages/core/session-persistence-jsonl/lib/index.js` `SessionLogScanner.consumeEventLine`:
+each event's `seq` must equal its index in the log) — the same check that makes
+a corrupted session permanently unloadable (#1497/#1469) and, for a single bad
+log, can 500 the whole `session.list` sidebar (#1047/#1473). `--session <log>`
+now runs both the orphan-`tool_call` scan (check 9) and this seq scan.
+Check 15 targets the `parseFrontmatter` failure in
+`packages/skills/skill-filesystem` that silently drops a skill when an unquoted
+`description` contains ASCII `": "` (#1401/#936). Check 16 reads the Windows
+`netsh` excluded-port ranges (Hyper-V/WSL2/Docker NAT bands) that make dsh's
+default port 3080 unbindable (#1462). Check 17 probes the same PATH assumptions
+dsh's subprocess backend makes (`env node`; #1270/#1772).
 
 The install discovery used by checks 4 & 12 was also fixed to recognize the
 npm-global-prefix layout (`<prefix>/node_modules/@deepseek-ai/dsh`, no `lib/`

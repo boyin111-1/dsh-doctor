@@ -19,6 +19,9 @@
  *   T11 toolkit-plugins 持久化插件源码（.mjs/host.js/空壳三分）
  *   T12 host/profile 版本漂移（#1515 reading 'prepare'）
  *   T13 Windows 沙箱 schannel TLS 探测（#1789）
+ *   T14 会话日志 seq 完整性（#1497/#1469 seq gap/重复/倒退）
+ *   T15 skill frontmatter 冒号陷阱（#1401）
+ *   T16 Windows 端口排除段（#1462）
  */
 import { execFileSync, execSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync, existsSync, readdirSync } from "node:fs";
@@ -290,7 +293,11 @@ console.log("\n== GOOD: 健康 profile（应全绿，无误报）==");
 	writeFileSync(join(okpkg, "package.json"), '{"name":"ok-plugin","main":"index.js"}');
 	writeFileSync(join(okpkg, "index.js"), "");
 	const { out } = run(goodHome);
-	const profileLines = out.split("\n").filter((l) => l.trim().startsWith("✓") || l.trim().startsWith("✗") || l.trim().startsWith("⚠"));
+	// 只统计 profile 检查段（📦 profile 到 📌 全局检查之间）——全局检查
+	// （TUI 补丁/沙箱 TLS/skill frontmatter/端口排除/PATH 工具）依赖本机
+	// 环境（如 zstd 是否安装），不属于"profile 是否健康"的断言范围。
+	const profileSeg = out.split("📦 profile: healthy")[1]?.split("📌 全局检查")[0] ?? out;
+	const profileLines = profileSeg.split("\n").filter((l) => l.trim().startsWith("✓") || l.trim().startsWith("✗") || l.trim().startsWith("⚠"));
 	const xl = profileLines.filter((l) => l.trim().startsWith("✗"));
 	const wl = profileLines.filter((l) => l.trim().startsWith("⚠"));
 	assert(xl.length === 0 && wl.length === 0, "healthy 无 ✗/⚠（无误报）",
@@ -491,6 +498,66 @@ console.log("\n== T13: Windows 沙箱 schannel TLS 探测（#1789；非 Windows 
 		rmSync(th, { recursive: true, force: true });
 	} else {
 		console.log("  · 非 Windows，T13 自动跳过（schannel 仅存在于 Windows）");
+	}
+}
+
+console.log("\n== T14: 会话日志 seq 完整性（#1497/#1469 seq gap / 重复 / 倒退）==");
+{
+	const sh = makeHome();
+	const cdir = mkdirSync(join(sh, "sessions"), { recursive: true });
+	const ev = (seq, type) => JSON.stringify({ type, seq, time: 1, data: { turn: 1 } });
+	// 坏：(a) seq 空洞（1 缺失） (b) seq 重复 (c) seq 倒退
+	const badLog = join(cdir, "bad-seq.jsonl");
+	writeFileSync(badLog, [
+		ev(0, "a"), ev(1, "b"), ev(3, "c"), // gap: 2 缺失
+		ev(3, "d"),                        // 重复 3
+		ev(2, "e"),                        // 倒退到 2
+	].join("\n") + "\n");
+	const { out } = runWith(doctor, ["--session", badLog]);
+	assert(out.includes("seq 空洞"), "报出 seq 空洞（#1469/#1497）", out.split("\n").filter((l) => l.includes("seq")).join(" | "));
+	assert(out.includes("seq 重复"), "报出 seq 重复（#1497/#1287）", out.split("\n").filter((l) => l.includes("seq")).join(" | "));
+	assert(out.includes("seq 倒退"), "报出 seq 倒退（#1433/#1452）", out.split("\n").filter((l) => l.includes("seq")).join(" | "));
+
+	// 好：连续 seq → 无问题
+	const goodLog = join(cdir, "good-seq.jsonl");
+	writeFileSync(goodLog, [ev(0, "a"), ev(1, "b"), ev(2, "c"), ev(3, "d")].join("\n") + "\n");
+	const { out: out2 } = runWith(doctor, ["--session", goodLog]);
+	assert(out2.includes("会话 seq 连续"), "连续 seq 全绿无不误报", out2.split("\n").filter((l) => l.includes("seq")).join(" | ") || "");
+	rmSync(sh, { recursive: true, force: true });
+}
+
+console.log("\n== T15: skill frontmatter 冒号陷阱（#1401/#936）==");
+{
+	const sh = makeHome();
+	writeProfile(sh, "skill-probe", {}); // doctor 需要 profiles 存在才会跑到全局检查
+	// preset skills 目录：~/.dsh/.agent-presets/<id>/skills/<name>/SKILL.md
+	const badSkill = join(sh, ".agent-presets", "demo", "skills", "foo", "SKILL.md");
+	mkdirSync(dirname(badSkill), { recursive: true });
+	writeFileSync(badSkill, "---\nname: foo\ndescription: Use when user asks. Priority order: check curated list first.\n---\n");
+	const goodSkill = join(sh, ".agent-presets", "demo", "skills", "bar", "SKILL.md");
+	mkdirSync(dirname(goodSkill), { recursive: true });
+	writeFileSync(goodSkill, '---\nname: bar\ndescription: "Quoted: safe here."\n---\n');
+	const { out } = runWith(doctor, [], { DSH_HOME: sh });
+	assert(out.includes("skill frontmatter 冒号未加引号"), "报出未加引号的冒号 description", out.split("\n").filter((l) => l.includes("frontmatter")).join(" | "));
+	assert(out.includes("foo") && out.includes("Priority order"), "指明具体 skill 与问题文本", out.split("\n").filter((l) => l.includes("foo")).join(" | "));
+	// 好 skill 不应被误报（bar 用引号包裹）
+	assert(!out.includes("bar"), "已加引号的不误报", out.split("\n").filter((l) => l.includes("bar")).join(" | ") || "bar not flagged ✓");
+	rmSync(sh, { recursive: true, force: true });
+}
+
+console.log("\n== T16: Windows 端口排除段（#1462；非 Windows 自动跳过）==");
+{
+	if (process.platform === "win32") {
+		const th = makeHome();
+		writeProfile(th, "port-probe", {});
+		const { out } = runWith(doctor, [], { DSH_HOME: th });
+		const lines = out.split("\n").filter((l) => l.includes("端口"));
+		assert(lines.length > 0, "输出包含端口排除段检查行", lines.join(" | ") || "");
+		assert(lines.some((l) => l.includes("不在 Windows 排除段内") || l.includes("在 Windows 排除段") || l.includes("netsh 无输出") || l.includes("netsh 不可用")),
+			"端口检查有确定结论（不静默跳过）", lines.join(" | ") || "");
+		rmSync(th, { recursive: true, force: true });
+	} else {
+		console.log("  · 非 Windows，T16 自动跳过");
 	}
 }
 
