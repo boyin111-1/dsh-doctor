@@ -529,6 +529,56 @@ console.log("\n== T14: 会话日志 seq 完整性（#1497/#1469 seq gap / 重复
 	rmSync(sh, { recursive: true, force: true });
 }
 
+console.log("\n== T14b: 会话日志 chunk-row 打包行展开（rc.6 语义；#2068 族）==");
+{
+	const sh = makeHome();
+	const cdir = mkdirSync(join(sh, "sessions"), { recursive: true });
+	// rc.6 打包行：一行含 seq0 + 多成员增量（texts/args + dt），展开后事件 seq = seq0+k。
+	const pack = (seq0, tag, payload, dt) => {
+		const data = tag === "tool-call-chunks"
+			? { turn: 1, step: 1, index: 0, id: "call_x", name: "bash", args: payload, dt }
+			: { turn: 1, step: 1, index: 0, dt, texts: payload };
+		return JSON.stringify({ type: tag, seq0, time0: 1, data });
+	};
+
+	// (a) 健康：普通行 + 合法打包行（展开后 seq 连续）→ 不误报
+	const goodChunk = join(cdir, "good-chunk.jsonl");
+	writeFileSync(goodChunk, [
+		JSON.stringify({ type: "assistant/chunk", seq: 0, time: 1, data: { turn: 1 } }),
+		pack(1, "reasoning-chunks", ["a", "b"], [1]),      // 展开为 seq 1,2
+		JSON.stringify({ type: "assistant/chunk", seq: 3, time: 1, data: { turn: 1 } }),
+		pack(4, "tool-call-chunks", ["{", "}"], [2]),       // 展开为 seq 4,5
+	].join("\n") + "\n");
+	const { out: outG } = runWith(doctor, ["--session", goodChunk]);
+	assert(outG.includes("会话 seq 连续") && !outG.includes("seq 空洞"),
+		"合法 chunk-row 展开后 seq 连续 → 不误报空洞",
+		outG.split("\n").filter((l) => l.includes("seq")).join(" | ") || "");
+
+	// (b) 坏：malformed 打包行（dt 长度不匹配）→ 报损坏行
+	const badChunk = join(cdir, "bad-chunk.jsonl");
+	writeFileSync(badChunk, [
+		JSON.stringify({ type: "assistant/chunk", seq: 0, time: 1, data: { turn: 1 } }),
+		pack(1, "reasoning-chunks", ["a", "b"], [1, 9]),   // dt 长度 2 ≠ 成员数 2-1
+	].join("\n") + "\n");
+	const { out: outB } = runWith(doctor, ["--session", badChunk]);
+	assert(outB.includes("会话损坏行") && outB.includes("dt length"),
+		"malformed chunk-row → 报损坏行（fail-loud，对齐 loader）",
+		outB.split("\n").filter((l) => l.includes("损坏") || l.includes("dt")).join(" | ") || "");
+
+	// (c) 坏：envelope 缺字段 → 报损坏行
+	const badEnv = join(cdir, "bad-env.jsonl");
+	writeFileSync(badEnv, [
+		JSON.stringify({ type: "assistant/chunk", seq: 0, time: 1, data: { turn: 1 } }),
+		JSON.stringify({ type: "text-chunks", seq0: 1, data: { turn: 1, step: 1, index: 0, dt: [1], texts: ["a", "b"] } }),
+	].join("\n") + "\n");
+	const { out: outE } = runWith(doctor, ["--session", badEnv]);
+	assert(outE.includes("会话损坏行") && outE.includes("envelope"),
+		"envelope 缺字段 → 报损坏行（fail-loud）",
+		outE.split("\n").filter((l) => l.includes("损坏") || l.includes("envelope")).join(" | ") || "");
+
+	rmSync(sh, { recursive: true, force: true });
+}
+
 console.log("\n== T15: skill frontmatter 冒号陷阱（#1401/#936）==");
 {
 	const sh = makeHome();

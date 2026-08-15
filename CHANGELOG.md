@@ -2,6 +2,22 @@
 
 All notable changes to dsh-doctor. Format follows [Keep a Changelog](https://keepachangelog.com/), versions match the npm `version` field.
 
+## [0.4.1] - 2026-08-16
+
+### Fixed
+- **Check 14（会话日志 seq 完整性）误报修复：按 rc.6 chunk-row 展开语义核对.**
+  rc.6 起 dsh 把连续的 `assistant/chunk` 增量事件打包成一行存储行
+  （`text-chunks` / `reasoning-chunks` / `tool-call-chunks`，见
+  `@deepseek-ai/dsh-session` 的 `chunk-rows.js`），loader 的 seq 连续性校验
+  （`SessionLogScanner.consumeEventLine`）是在**展开后的事件流**上做的。旧检查
+  逐行按 `seq` 判断，把含打包行的健康日志误报为 seq 空洞（实测一个健康会话
+  518 行打包行 → 误报 92 处）。现新增 `expandStorageRow()`（镜像
+  `decodeStorageRecord` 的零依赖纯 Node 实现）：普通行原样返回；打包行严格校验
+  envelope（`{type, seq0, time0, data}`）与 data 形状后展开成 `seq0+k` 事件序列；
+  malformed 打包行 fail-loud 报「会话损坏行」——与 loader 一致，绝不静默跳过。
+- 测试套件新增 T14b（chunk-row 展开）：合法打包行展开后 seq 连续不误报；
+  dt 长度不匹配 / envelope 缺字段均报损坏行。
+
 ## [0.4.0] - 2026-08-15
 
 ### Added

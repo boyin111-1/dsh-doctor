@@ -634,6 +634,69 @@ function checkSessionOrphanToolCalls(sessionPath, display) {
 }
 
 /**
+ * 展开一行存储记录为事件列表（镜像 @deepseek-ai/dsh-session chunk-rows.js 的
+ * decodeStorageRecord，零依赖纯 Node 实现）。
+ *
+ * rc.6 起，日志会把一段连续的 `assistant/chunk` 增量事件打包成一行存储行
+ * （`text-chunks` / `reasoning-chunks` / `tool-call-chunks`，见 packChunkRuns），
+ * 读取时由 decodeStorageRecord 校验并展开回原事件。loader 的 seq 连续性校验
+ * （SessionLogScanner.consumeEventLine：`event.seq === events.length`）是在
+ * **展开后的事件流**上做的——因此 seq 检查必须按同样的语义展开，否则健康日志
+ * （含打包行）会被误判为 seq 空洞（实测：一个健康会话 518 行打包行 → 误报 92 处）。
+ *
+ * 本函数返回展开后的最小事件视图（seq + type 足够 seq 校验用；时间/内容不参与）。
+ * malformed 打包行抛错——loader 同样 fail-loud（"malformed ... storage row" /
+ * "corrupt session log: unparsable committed event"），绝不静默跳过整段 run。
+ *
+ * @param value - 一行 JSON.parse 的结果。
+ * @returns 事件列表（普通行原样返回单事件；打包行展开成 seq0+k 序列）。
+ * @throws 打包行结构非法时抛 Error（对齐 validateRow 的 malformed 诊断）。
+ */
+function expandStorageRow(value) {
+	if (typeof value !== "object" || value === null) return [value];
+	const tag = value.type;
+	if (tag !== "text-chunks" && tag !== "reasoning-chunks" && tag !== "tool-call-chunks") return [value];
+	const envKeys = Object.keys(value);
+	if (envKeys.length !== 4 || !["seq0", "time0", "data"].every((k) => Object.hasOwn(value, k))) {
+		throw new Error(`malformed ${tag} storage row: envelope must be exactly {type, seq0, time0, data}`);
+	}
+	if (!Number.isSafeInteger(value.seq0) || value.seq0 < 0) throw new Error(`malformed ${tag} storage row: seq0 must be a non-negative safe integer`);
+	if (!Number.isSafeInteger(value.time0)) throw new Error(`malformed ${tag} storage row: time0 must be a safe integer`);
+	const data = value.data;
+	if (typeof data !== "object" || data === null) throw new Error(`malformed ${tag} storage row: data must be an object`);
+	let payload;
+	if (tag === "tool-call-chunks") {
+		const keys = Object.keys(data);
+		const withName = keys.length === 7 && Object.hasOwn(data, "name");
+		const shapeOk = (withName && ["turn", "step", "index", "id", "name", "dt", "args"].every((k) => Object.hasOwn(data, k)))
+			|| (!withName && keys.length === 6 && ["turn", "step", "index", "id", "dt", "args"].every((k) => Object.hasOwn(data, k)));
+		if (!shapeOk) throw new Error(`malformed ${tag} storage row: data must be exactly {turn, step, index, id, name?, dt, args}`);
+		if (typeof data.id !== "string" || (withName && typeof data.name !== "string")) throw new Error(`malformed ${tag} storage row: id (and name when present) must be strings`);
+		payload = data.args;
+	} else {
+		if (!(Object.keys(data).length === 5 && ["turn", "step", "index", "dt", "texts"].every((k) => Object.hasOwn(data, k)))) {
+			throw new Error(`malformed ${tag} storage row: data must be exactly {turn, step, index, dt, texts}`);
+		}
+		payload = data.texts;
+	}
+	if (!Array.isArray(payload) || payload.length === 0 || payload.some((entry) => typeof entry !== "string")) {
+		throw new Error(`malformed ${tag} storage row: ${tag === "tool-call-chunks" ? "args" : "texts"} must be a non-empty string array`);
+	}
+	if (!Array.isArray(data.dt) || data.dt.some((gap) => !Number.isSafeInteger(gap))) {
+		throw new Error(`malformed ${tag} storage row: dt must be an array of safe integers`);
+	}
+	if (data.dt.length !== payload.length - 1) {
+		throw new Error(`malformed ${tag} storage row: dt length ${data.dt.length} does not match ${payload.length} members`);
+	}
+	if (!Number.isSafeInteger(value.seq0 + payload.length - 1)) {
+		throw new Error(`malformed ${tag} storage row: member seqs must stay safe integers`);
+	}
+	const events = [];
+	for (let k = 0; k < payload.length; k++) events.push({ seq: value.seq0 + k, type: "assistant/chunk" });
+	return events;
+}
+
+/**
  * 会话日志 seq 完整性检测（#1497/#1469/#1586/#1452/#1433/#1333/#1305/#1287/#1299）。
  *
  * dsh 的 SessionLogScanner.consumeEventLine 要求每个事件的 `seq` 与它在日志中的
@@ -644,8 +707,14 @@ function checkSessionOrphanToolCalls(sessionPath, display) {
  * 任何一种都会让加载器报 `corrupt session log: seq gap in committed region`，
  * 整段历史永久不可加载（#1047/#1473：单个坏日志还能让 session.list 整体 500）。
  *
- * 本检查只做只读扫描：解压 → 逐行核对 seq 连续性 → 报告具体行号与
- * expected/got，帮助在打开会话前先判断日志是否已损坏、损坏在哪一行。
+ * 本检查做只读扫描：解压 → 按 loader 的展开语义（decodeStorageRecord，见
+ * expandStorageRow）逐事件核对 seq 连续性 → 报告具体行号与 expected/got，
+ * 帮助在打开会话前先判断日志是否已损坏、损坏在哪一行。
+ *
+ * 注意：rc.6 起日志含 chunk-row 打包行（一行多个 assistant/chunk 事件），
+ * seq 校验必须按展开后的事件流做——与 SessionLogScanner.consumeEventLine
+ * （`event.seq === this.events.length`）完全一致，否则健康日志会被误报为
+ * seq 空洞。malformed 打包行直接报损坏（loader 同样 fail-loud）。
  *
  * @param sessionPath - `session.jsonl.zstd` / 明文 `.jsonl` 文件路径。
  * @param display - 会话显示名。
@@ -657,28 +726,38 @@ function checkSessionSeqIntegrity(sessionPath, display) {
 		return;
 	}
 	let expected = 0, line = 0, issues = 0, events = 0;
-	const gaps = [], dupes = [], rewind = [];
+	const gaps = [], dupes = [], rewind = [], badRows = [];
 	for (const l of raw.split("\n")) {
 		line++;
 		if (!l.trim()) continue;
 		let d;
 		try { d = JSON.parse(l); } catch { continue; }
-		const seq = d.seq;
-		if (!Number.isInteger(seq)) continue;
-		events++;
-		if (seq === expected) { expected++; continue; }
-		if (seq > expected) { gaps.push(`L${line} seq ${expected}→${seq}（缺 ${seq - expected}）`); expected = seq + 1; issues++; }
-		else if (seq === expected - 1) { /* 重复的旧 seq 也计问题 */ dupes.push(`L${line} seq ${seq} 重复`); issues++; }
-		else { rewind.push(`L${line} seq ${seq} 倒退（已见 ${expected - 1}）`); issues++; }
+		let decoded;
+		try { decoded = expandStorageRow(d); }
+		catch (e) {
+			badRows.push(`L${line} ${e.message}`);
+			issues++;
+			continue;
+		}
+		for (const ev of decoded) {
+			const seq = ev.seq;
+			if (!Number.isInteger(seq)) continue;
+			events++;
+			if (seq === expected) { expected++; continue; }
+			if (seq > expected) { gaps.push(`L${line} seq ${expected}→${seq}（缺 ${seq - expected}）`); expected = seq + 1; issues++; }
+			else if (seq === expected - 1) { /* 重复的旧 seq 也计问题 */ dupes.push(`L${line} seq ${seq} 重复`); issues++; }
+			else { rewind.push(`L${line} seq ${seq} 倒退（已见 ${expected - 1}）`); issues++; }
+		}
 	}
 	if (issues === 0) {
-		report("✓", `会话 seq 连续: ${display}（${events} 事件无 gap/重复）`);
+		report("✓", `会话 seq 连续: ${display}（${events} 事件无 gap/重复，含 chunk-row 展开）`);
 		return;
 	}
 	const MAX_SHOW = 4;
 	const show = (arr) => arr.slice(0, MAX_SHOW).join("; ") + (arr.length > MAX_SHOW ? ` …（共 ${arr.length} 处）` : "");
+	if (badRows.length) report("✗", `会话损坏行: ${display} — ${show(badRows)}（loader 将报 corrupt session log: unparsable committed event）`);
 	if (gaps.length) report("✗", `会话 seq 空洞: ${display} — ${show(gaps)}（#1469/#1497 压缩/崩溃后未重排 seq，加载器将报 corrupt session log）`);
-	if (dupes.length) report("✗", `会话 seq 重复: ${display} — ${show(dupes)}（#1497/#1287 崩溃重放已提交事件）`);
+	if (dupes.length) report("✗", `会话 seq 重复: ${display} — ${show(dupes)}（#1497/#1287/#2068 崩溃重放或并发分配同一 seq）`);
 	if (rewind.length) report("✗", `会话 seq 倒退: ${display} — ${show(rewind)}（#1433/#1452/#1586 并发写/重放导致 seq 撞号）`);
 }
 
