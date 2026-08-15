@@ -584,7 +584,7 @@ console.log("\n== T17: 锚点基线防漂移（版本漂移自动核对；本机
 		}
 		const binDir = join(h, "bin");
 		mkdirSync(binDir, { recursive: true });
-		writeFileSync(join(binDir, "dsh"), "#!/usr/bin/env node\n");
+		writeFileSync(join(binDir, "dsh"), "#!/usr/bin/env node\n"); execSync(`chmod +x ${JSON.stringify(join(binDir, "dsh"))}`);
 		writeProfile(h, "probe", {});
 		return { h, binDir };
 	};
@@ -667,7 +667,7 @@ console.log("\n== T19: --fix 防漂移闸门（锚点脱节 → fail-closed 中�
 		}
 		const binDir = join(h, "bin");
 		mkdirSync(binDir, { recursive: true });
-		writeFileSync(join(binDir, "dsh"), "#!/usr/bin/env node\n");
+		writeFileSync(join(binDir, "dsh"), "#!/usr/bin/env node\n"); execSync(`chmod +x ${JSON.stringify(join(binDir, "dsh"))}`);
 		const tuiFile = join(h, "profiles", "tui", "node_modules", "@earendil-works", "pi-tui", "dist", "tui-main-screen.js");
 		mkdirSync(dirname(tuiFile), { recursive: true });
 		writeFileSync(tuiFile,
