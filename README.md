@@ -54,6 +54,8 @@ to vet a profile before switching to it.
 | 9 | Dangling `tool_call` (session) | a `tool/call` with no matching `tool/result` (by `message.source.callId`) in a completed turn → every later request rejected with `400 insufficient tool messages` | #1544, #1363 |
 | 10 | TUI over-wide-line crash patch | `pi-tui`'s `tui-main-screen.js` still throws (`throw new Error(errorMsg)`) on any rendered line wider than the terminal → kills the whole pi process; `--fix` re-applies the truncate patch (`.bak` backup) | runtime incident |
 | 11 | `toolkit-plugins` persistence | `.mjs` global tools (host-composed) vs `host.js`/`client.js` dynamic-plugin sources (the `plugin_deploy` recovery prerequisite); an empty kit dir warns | — |
+| 12 | host ↔ profile `@deepseek-ai/*` version drift | a profile-top-level copy of a `dsh-*`/shared package whose version differs from the installed dsh → the module-local `TOOL_RUNTIME_SCHEDULER` Symbol mismatch that crashes **every** tool call with `Cannot read properties of undefined (reading 'prepare')` (or `cannot get property "tools" without inject` for shared libs); fix hint: delete the copy or `pnpm add @deepseek-ai/<pkg>@<installed>` | #1515 |
+| 13 | Windows sandbox schannel TLS | probes `curl.exe` HTTPS under the current token; `SEC_E_NO_CREDENTIALS (0x8009030e)` means the ACL-restricted token (workspace-write sandbox) breaks schannel — contradicting the sandbox doc's "network not restricted" claim; workaround: `danger-full-access` for network commands or a non-schannel client (Python/OpenSSL) | #1789 |
 
 Checks 6 & 7 mirror `packages/boot/app-boot/src/profile.ts` `resolveBundleDir`
 (two-anchor: install package first, then profile dir) and the bundle-manifest
@@ -68,6 +70,22 @@ poisons every subsequent request (#1544). A dangling call in the **latest still
 active** turn is reported as a warning (likely in-flight), not a hard error, so
 scanning a live session doesn't false-positive. Read side consumes zstd frames
 (`zstd -dc`) or plain JSONL.
+
+Check 12 implements the version-drift check proposed in
+[#1515](https://github.com/deepseek-ai/deepseek-harness/discussions/1515): the
+`TOOL_RUNTIME_SCHEDULER` symbol in `packages/core/tools/src/index.ts` is a
+**non-global** `Symbol` (not `Symbol.for`), so host (rc.5) and profile (rc.6)
+copies disagree and `startCall` throws at
+`packages/core/agent-loop/src/tool-calls.ts` (`ctx.tools[TOOL_RUNTIME_SCHEDULER].prepare`).
+Check 13 surfaces [#1789](https://github.com/deepseek-ai/deepseek-harness/discussions/1789):
+the ACL-restricted token from `dsh-sandbox-windows-acl` (`CreateRestrictedToken`,
+dwFlags=13) breaks schannel TLS on Windows, which contradicts the sandbox doc's
+"reads, network, and process visibility are NOT restricted".
+
+The install discovery used by checks 4 & 12 was also fixed to recognize the
+npm-global-prefix layout (`<prefix>/node_modules/@deepseek-ai/dsh`, no `lib/`
+layer) in addition to the nvm layout — previously a dsh installed that way
+silently skipped the dual-instance and drift checks.
 
 ## Staying aligned with the dsh you actually run (anti-rot)
 

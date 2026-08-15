@@ -17,9 +17,10 @@
  *   node dsh-doctor.mjs --session <log>     # 扫会话日志里的悬空 tool_call（#1544/#1363）
  *   node dsh-doctor.mjs --verify-anchors <dshRepo>  # 核对检测锚点是否仍与官方源码一致
  *   DSH_HOME=/path dsh-doctor.mjs  # 指定 Harness home（默认 ~/.dsh）
- *   node dsh-doctor.mjs 检查项 ≥11 类：悬空引用 / file:链接 / 重复id /
+ *   node dsh-doctor.mjs 检查项 ≥13 类：悬空引用 / file:链接 / 重复id /
  *      入口产物 / 双实例 / bundles完整性 / bundle-id碰撞 / bundle冗余insert /
- *      会话孤儿tool_call / TUI超宽行崩溃补丁 / toolkit-plugins持久化插件源码
+ *      会话孤儿tool_call / TUI超宽行崩溃补丁 / toolkit-plugins持久化插件源码 /
+ *      版本漂移(#1515) / 沙箱schannel TLS(#1789)
  */
 
 import { createRequire } from "node:module";
@@ -154,9 +155,15 @@ function findDshInstall() {
 					// bin 直接就是 .../@deepseek-ai/dsh/bin/dsh 之类的布局 → 包根即 dir
 					return dir;
 				}
-				// 常见布局：.../lib/node_modules/@deepseek-ai/dsh/...
-				const cand = join(dir, "lib", "node_modules", "@deepseek-ai", "dsh");
-				if (existsSync(join(cand, "package.json"))) return cand;
+				// 常见布局：
+				//   a) npm 全局 prefix：.../node_modules/@deepseek-ai/dsh（无 lib/ 层）
+				//   b) nvm / npm --prefix=.../lib：.../lib/node_modules/@deepseek-ai/dsh
+				for (const cand of [
+					join(dir, "node_modules", "@deepseek-ai", "dsh"),
+					join(dir, "lib", "node_modules", "@deepseek-ai", "dsh"),
+				]) {
+					if (existsSync(join(cand, "package.json"))) return cand;
+				}
 				dir = dirname(dir);
 			}
 		}
@@ -230,6 +237,94 @@ function checkDualInstances(profileDir) {
 			const verNote = profileVer !== installVer ? `（profile v${profileVer} vs 安装 v${installVer}）` : `（同版本 v${profileVer} —— 正是 #1486 的模块级 Symbol 崩溃场景）`;
 			report("✗", `双模块实例: @deepseek-ai/${pkg} 在 ${basename(profileDir)} 顶层有独立副本（非指向安装的链接）${verNote}——两个实例会各自持有模块级状态导致工具层崩溃（#1486）`);
 		});
+}
+
+/**
+ * 版本漂移检测（#1515：host 与 profile 各自持有不同版本的 @deepseek-ai/* 包）。
+ *
+ * 背景（社区讨论 #1515，rc.6 实测）：profile 里 `pnpm install` 把
+ * @deepseek-ai/dsh-tools@rc.6 提升进 profile/node_modules，而 host bundle 仍是
+ * rc.5。dsh-tools 的 TOOL_RUNTIME_SCHEDULER 是**非全局** Symbol（非 Symbol.for），
+ * host 的 agent-loop 从自己那份 import 它，ctx.tools 却是 profile 那份构建的
+ * ToolRuntime → ctx.tools[TOOL_RUNTIME_SCHEDULER] === undefined →
+ * startCall 抛 "Cannot read properties of undefined (reading 'prepare')"，
+ * 会话里每个工具调用都直接失败。
+ *
+ * 与 checkDualInstances 的分工：
+ *   - checkDualInstances 只管"存在独立副本"（同版本也崩，#1486 模块级状态）；
+ *   - 本检查聚焦**版本不一致**（#1515），并给出对齐修复指引；且覆盖 cordis 等
+ *     共享库（#1515 第二类症状 "cannot get property tools without inject"）。
+ *
+ * 严重度分级：dsh-* 运行时组件版本漂移 → ✗（工具层必崩）；其余 @deepseek-ai/*
+ * （cordis / cosmokit 等共享库）漂移 → ⚠（潜在 inject 失败）。
+ */
+function checkVersionDrift(profileDir) {
+	const profileScoped = join(profileDir, "node_modules", "@deepseek-ai");
+	if (!existsSync(profileScoped)) return;
+	const installRoot = findDshInstall();
+	if (!installRoot) return;
+	const installScoped = join(installRoot, "node_modules", "@deepseek-ai");
+	if (!existsSync(installScoped)) return;
+	const readVer = (dir) => {
+		try { return JSON.parse(readFileSync(join(dir, "package.json"), "utf-8")).version; }
+		catch { return null; }
+	};
+	const installPkgs = new Set(readdirSync(installScoped));
+	for (const pkg of readdirSync(profileScoped)) {
+		if (!installPkgs.has(pkg)) continue;
+		const pv = readVer(join(profileScoped, pkg));
+		const iv = readVer(join(installScoped, pkg));
+		if (!pv || !iv || pv === iv) continue;
+		const fix = `删除 ${join(profileScoped, pkg)} 副本 或 pnpm add @deepseek-ai/${pkg}@${iv} 对齐安装版本`;
+		if (pkg.startsWith("dsh-")) {
+			report("✗", `版本漂移: @deepseek-ai/${pkg} profile v${pv} ≠ 安装 v${iv}（#1515：Symbol 不匹配 → 工具调用崩 reading 'prepare'）; 修复: ${fix}`);
+		} else {
+			report("⚠", `版本漂移: @deepseek-ai/${pkg} profile v${pv} ≠ 安装 v${iv}（#1515：共享库副本可能引发 "cannot get property tools without inject"）; 修复: ${fix}`);
+		}
+	}
+}
+
+/**
+ * Windows 沙箱 TLS 探测（#1789：受限令牌下 schannel 拿不到 TLS 凭据）。
+ *
+ * 背景：dsh-sandbox-windows-acl 用 CreateRestrictedToken 创建受限令牌跑
+ * workspace-write 沙箱命令，Windows schannel（curl.exe/.NET HttpClient）因此
+ * `SEC_E_NO_CREDENTIALS (0x8009030e)` 无法完成 TLS——与沙箱文档
+ * "reads, network, and process visibility are NOT restricted" 矛盾。
+ *
+ * 本检查：先探测当前进程是否受限令牌（whoami /groups 找 deny-only），再实测
+ * curl.exe 的 HTTPS 握手。命中特征错误即报 #1789 并给 workaround；完整令牌或
+ * 握手成功则放行。dsh-doctor 由用户在受限会话里跑时即可现场复现该 bug。
+ */
+function checkSandboxTls() {
+	if (process.platform !== "win32") return; // schannel 仅存在于 Windows
+	let restricted = false;
+	try {
+		const groups = execSync("whoami /groups", { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+		restricted = /deny-only|restricted/i.test(groups);
+	} catch { /* 探测失败不阻塞后续实测 */ }
+	let httpCode = null, errText = "";
+	try {
+		httpCode = execSync('curl.exe -s -o NUL -w "%{http_code}" -m 10 https://example.com', {
+			encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 15000,
+		}).trim();
+	} catch (e) {
+		errText = String(e.stderr ?? "");
+	}
+	const tokenDesc = restricted ? "受限令牌(workspace-write 沙箱)" : "完整令牌";
+	if (httpCode === "200") {
+		report("✓", `沙箱 TLS: ${tokenDesc} 下 curl HTTPS 握手成功（HTTP 200，#1789 未复现）`);
+		return;
+	}
+	if (/SEC_E_NO_CREDENTIALS|AcquireCredentialsHandle/i.test(errText)) {
+		report("✗", `沙箱 TLS: ${tokenDesc} 下 schannel 无法获取 TLS 凭据（${errText.match(/SEC_E_[A-Z_]+/)?.[0] ?? "SEC_E_NO_CREDENTIALS"}）—— 命中 #1789；workaround: 用 danger-full-access 模式跑联网命令，或改用 Python/OpenSSL 等非 schannel 客户端`);
+		return;
+	}
+	if (httpCode === null) {
+		report("⚠", `沙箱 TLS: 无法用 curl 完成 HTTPS 探测（${errText.trim().split("\n")[0].slice(0, 100) || "curl 不可用/超时"}）—— 若在受限会话里且错误含 SEC_E_NO_CREDENTIALS 即 #1789`);
+		return;
+	}
+	report("✓", `沙箱 TLS: ${tokenDesc} 下 curl HTTPS 返回 HTTP ${httpCode}（非 #1789 特征）`);
 }
 
 /** 从 anchor（package.json 路径）解析包目录，镜像 profile.ts packageDirFromAnchor。 */
@@ -590,6 +685,9 @@ function checkProfile(dir) {
 	// 7. 双模块实例检测（覆盖 #1486）
 	checkDualInstances(profileDir);
 
+	// 7b. host/profile 版本漂移检测（覆盖 #1515：reading 'prepare' 崩溃）
+	checkVersionDrift(profileDir);
+
 	// 8. dsh.profile.bundles 完整性检测（覆盖 #917 悬空 bundle 残留）
 	const installAnchor = findInstallAnchor();
 	checkBundles(profileDir, installAnchor);
@@ -804,6 +902,9 @@ for (const p of profiles) checkProfile(join(profilesRoot, p));
 
 // 额外：TUI profile 的超宽行崩溃补丁完整性（不属于 profile 清单检查，单独跑）
 checkTuiPatch();
+
+// 额外：Windows 沙箱 schannel TLS 探测（#1789，独立于 profile）
+checkSandboxTls();
 
 console.log(`\n========== 结果: ${pass} ✓ / ${warn} ⚠ / ${fail} ✗ ==========`);
 

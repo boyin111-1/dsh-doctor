@@ -15,6 +15,10 @@
  *   D6 -> D7 bundle 无 dsh.bundle.patch（profile.ts 显式抛错路径）
  *   D7 -> D8 bundle 与用户 patch id 冲突（advisory item (a)、#1404/#1479）
  *   D8 -> D9 bundle 冗余 insert（#1404 reconcile 未清理）
+ *   T10 TUI 超宽行补丁（缺失检出 + --fix 重打）
+ *   T11 toolkit-plugins 持久化插件源码（.mjs/host.js/空壳三分）
+ *   T12 host/profile 版本漂移（#1515 reading 'prepare'）
+ *   T13 Windows 沙箱 schannel TLS 探测（#1789）
  */
 import { execFileSync, execSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync, existsSync, readdirSync } from "node:fs";
@@ -304,7 +308,10 @@ console.log("\n== GOOD: 健康 profile（应全绿，无误报）==");
 			catch { return false; }
 		})();
 		if (hasDsh) {
-			// 通过 dsh 的 realpath bin 定位安装根（.../@deepseek-ai/dsh）
+			// 通过 dsh 的 realpath bin 定位安装根（.../@deepseek-ai/dsh）。
+			// 与 dsh-doctor.mjs findDshInstall 相同：同时兼容
+			// `node_modules/@deepseek-ai/dsh`（npm 全局 prefix）和
+			// `lib/node_modules/@deepseek-ai/dsh`（nvm）两种布局。
 			let installRoot = null;
 			{
 				const bin = execSync(dshProbe, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim().split(/\r?\n/)[0];
@@ -312,8 +319,10 @@ console.log("\n== GOOD: 健康 profile（应全绿，无误报）==");
 				let d = dirname(real);
 				while (dirname(d) !== d) {
 					if (basename(d) === "dsh" && basename(dirname(d)) === "@deepseek-ai") { installRoot = d; break; }
-					const cand = join(d, "lib", "node_modules", "@deepseek-ai", "dsh");
-					if (existsSync(join(cand, "package.json"))) { installRoot = cand; break; }
+					for (const cand of [join(d, "node_modules", "@deepseek-ai", "dsh"), join(d, "lib", "node_modules", "@deepseek-ai", "dsh")]) {
+						if (existsSync(join(cand, "package.json"))) { installRoot = cand; break; }
+					}
+					if (installRoot) break;
 					d = dirname(d);
 				}
 			}
@@ -335,13 +344,21 @@ console.log("\n== GOOD: 健康 profile（应全绿，无误报）==");
 				rmSync(hA, { recursive: true, force: true });
 
 				// (b) symlink 指向安装同一份（pnpm file: 正常形态）→ 应不报
+				// Windows 无 SeCreateSymbolicLinkPrivilege（需管理员/开发者模式）时
+				// symlinkSync 抛 EPERM——那是环境限制，跳过该子断言而非让套件崩溃。
 				const hB = makeHome();
 				const pB = writeProfile(hB, "dup-inst-b", {});
 				mkdirSync(join(pB, "node_modules", "@deepseek-ai"), { recursive: true });
-				symlinkSync(join(installScoped, pkg), join(pB, "node_modules", "@deepseek-ai", pkg), "dir");
-				const { out: outB } = run(hB);
-				assert(!outB.includes("双模块实例"), "symlink 指向安装同一份→不误报",
-					outB.split("\n").filter((l) => l.includes("双模块")).join(" | ") || "");
+				try {
+					symlinkSync(join(installScoped, pkg), join(pB, "node_modules", "@deepseek-ai", pkg), "dir");
+					const { out: outB } = run(hB);
+					assert(!outB.includes("双模块实例"), "symlink 指向安装同一份→不误报",
+						outB.split("\n").filter((l) => l.includes("双模块")).join(" | ") || "");
+				} catch (e) {
+					if (e.code === "EPERM" || e.code === "EACCES") {
+						console.log("  · Windows 无 symlink 权限，symlink 子用例跳过（EPERM）");
+					} else { throw e; }
+				}
 				rmSync(hB, { recursive: true, force: true });
 			} else {
 				console.log("  · 本机 dsh 安装 scoped 目录不可用，双实例用例自动跳过");
@@ -391,6 +408,90 @@ console.log("\n== T11: toolkit-plugins 持久化插件源码（区分 .mjs 工�
 	assert(out.includes("全局工具插件: dev-kit"), "识别 index.mjs 全局工具", out.split("\n").filter((l) => l.includes("dev-kit")).join(" | "));
 	assert(out.includes("持久化插件目录异常: empty-kit"), "空壳目录告警", out.split("\n").filter((l) => l.includes("empty-kit")).join(" | "));
 	rmSync(th, { recursive: true, force: true });
+}
+
+console.log("\n== T12: host/profile 版本漂移（#1515：reading 'prepare' 崩溃场景）==");
+{
+	// 与 D12 相同：需要 PATH 里能解析到真实 dsh 安装。无则自动跳过。
+	const dshProbe = process.platform === "win32" ? "where dsh" : "command -v dsh";
+	const hasDsh = (() => {
+		try { const o = execSync(dshProbe, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim(); return o.length > 0; }
+		catch { return false; }
+	})();
+	if (hasDsh) {
+		// 定位安装 scoped 目录（与 D12 相同逻辑，兼容 npm 全局 prefix / nvm 两种布局）
+		let installRoot = null;
+		{
+			const bin = execSync(dshProbe, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim().split(/\r?\n/)[0];
+			let real = bin; try { real = realpathSync(bin); } catch {}
+			let d = dirname(real);
+			while (dirname(d) !== d) {
+				if (basename(d) === "dsh" && basename(dirname(d)) === "@deepseek-ai") { installRoot = d; break; }
+				for (const cand of [join(d, "node_modules", "@deepseek-ai", "dsh"), join(d, "lib", "node_modules", "@deepseek-ai", "dsh")]) {
+					if (existsSync(join(cand, "package.json"))) { installRoot = cand; break; }
+				}
+				if (installRoot) break;
+				d = dirname(d);
+			}
+		}
+		const installScoped = installRoot ? join(installRoot, "node_modules", "@deepseek-ai") : null;
+		if (installScoped && existsSync(installScoped) && readdirSync(installScoped).some((n) => n.startsWith("dsh-"))) {
+			const pkg = readdirSync(installScoped).find((n) => n.startsWith("dsh-") && existsSync(join(installScoped, n, "package.json")));
+
+			// (a) profile 顶层放一个不同版本的 dsh-* 真目录副本 → 应报版本漂移
+			const hA = makeHome();
+			const pA = writeProfile(hA, "drift-a", {});
+			mkdirSync(join(pA, "node_modules", "@deepseek-ai", pkg), { recursive: true });
+			writeFileSync(join(pA, "node_modules", "@deepseek-ai", pkg, "package.json"),
+				JSON.stringify({ name: `@deepseek-ai/${pkg}`, version: "0.0.0-drift", main: "index.js" }, null, 2) + "\n");
+			writeFileSync(join(pA, "node_modules", "@deepseek-ai", pkg, "index.js"), "");
+			const { out: outA } = run(hA);
+			assert(outA.includes("版本漂移: @deepseek-ai/" + pkg), "profile 版本 ≠ 安装版本→报版本漂移(#1515)",
+				outA.split("\n").filter((l) => l.includes("漂移")).join(" | ") || "");
+			rmSync(hA, { recursive: true, force: true });
+
+			// (b) symlink 指向安装同一份 → 应不报版本漂移（且不误报 #1515）
+			// Windows 无 symlink 权限时跳过（EPERM，环境限制）。
+			const hB = makeHome();
+			const pB = writeProfile(hB, "drift-b", {});
+			mkdirSync(join(pB, "node_modules", "@deepseek-ai"), { recursive: true });
+			try {
+				symlinkSync(join(installScoped, pkg), join(pB, "node_modules", "@deepseek-ai", pkg), "dir");
+				const { out: outB } = run(hB);
+				assert(!outB.includes("版本漂移"), "symlink 指向安装同一份→不误报版本漂移",
+					outB.split("\n").filter((l) => l.includes("漂移")).join(" | ") || "");
+			} catch (e) {
+				if (e.code === "EPERM" || e.code === "EACCES") {
+					console.log("  · Windows 无 symlink 权限，symlink 子用例跳过（EPERM）");
+				} else { throw e; }
+			}
+			rmSync(hB, { recursive: true, force: true });
+		} else {
+			console.log("  · 本机 dsh 安装 scoped 目录不可用，版本漂移用例自动跳过");
+		}
+	} else {
+		console.log("  · 本机 PATH 无 dsh，版本漂移用例自动跳过");
+	}
+}
+
+console.log("\n== T13: Windows 沙箱 schannel TLS 探测（#1789；非 Windows 自动跳过）==");
+{
+	if (process.platform === "win32") {
+		// doctor 需要 profiles 目录存在才会跑到 TLS 检查，先建一个空 profile
+		const th = makeHome();
+		writeProfile(th, "tls-probe", {});
+		// 完整令牌 + 网络可达 → 应报告握手成功或至少不误报 #1789
+		const { out } = runWith(doctor, [], { DSH_HOME: th });
+		const tlsLines = out.split("\n").filter((l) => l.includes("沙箱 TLS"));
+		assert(tlsLines.length > 0, "输出包含沙箱 TLS 探测行", tlsLines.join(" | ") || "");
+		// 不应在完整令牌下误报 #1789 命中（除非本机确实网络不可达——那是环境问题非本测试断言）
+		const hit = tlsLines.find((l) => l.includes("命中 #1789"));
+		assert(!hit || out.includes("受限令牌"), "完整令牌下不误报 #1789（除非受限令牌环境）",
+			tlsLines.join(" | ") || "");
+		rmSync(th, { recursive: true, force: true });
+	} else {
+		console.log("  · 非 Windows，T13 自动跳过（schannel 仅存在于 Windows）");
+	}
 }
 
 // 清理临时 home
