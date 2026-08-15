@@ -2,6 +2,28 @@
 
 All notable changes to dsh-doctor. Format follows [Keep a Changelog](https://keepachangelog.com/), versions match the npm `version` field.
 
+## [0.5.0] - 2026-08-15
+
+### Added
+- **Check 14 升级：packed 行解码 + 伴生引用扫描（#1469 压缩损坏的完整检测）。**
+  `--session` 的 seq 检查现在与 loader 一致地先展开 `text-chunks` /
+  `reasoning-chunks` / `tool-call-chunks` packed 行再核对连续性（旧实现逐行取
+  `seq`，对含 packed 行的正常日志会误报大量空洞），并新增 companion 扫描：
+  `sourceEventSeqs` / `data.sourceEventSeq` / `surfaceOp.start/end` 引用
+  自身、后续事件或日志中不存在的 seq（压缩折叠删事件但未重映射引用的典型
+  形态）——此前只有 seq gap 半边被覆盖。
+- **`--session <log> --fix`：原子会话日志 seq 修复写入路径。** 按出现顺序重排
+  全部 seq（含 packed `seq0`），全量重映射 seq 引用，剔除无法映射的悬空引用，
+  无法保持 replace 语义的 `surfaceOp` 行降级为普通事件；备份原文件
+  （`.bak-repair-<ts>`）→ 临时文件 → loader 规则校验（展开后连续、无
+  自身/后续/悬空引用）→ rename 替换，校验不过或写失败均不触碰原文件。
+- **zstd 读取不再依赖 `zstd` CLI。** `--session` 优先用 Node 内置 zstd
+  （Node ≥22.18）多帧解码，缺失时回退 `zstd -dc`；`--fix` 写回同样使用
+  Node 内置 zstd（checksum 帧），无 CLI 依赖。
+
+### Fixed
+- check 14 对 packed 日志的误报（见上）。
+
 ## [0.4.0] - 2026-08-15
 
 ### Added

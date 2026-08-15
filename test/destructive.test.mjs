@@ -528,6 +528,52 @@ console.log("\n== T14: 会话日志 seq 完整性（#1497/#1469 seq gap / 重复
 	rmSync(sh, { recursive: true, force: true });
 }
 
+console.log("\n== T14b: 会话日志 packed 行解码 + 伴生引用扫描 + --fix 原子修复 ==");
+{
+	const sh = makeHome();
+	const cdir = mkdirSync(join(sh, "sessions"), { recursive: true });
+	const ev = (seq, type, extra = {}) => JSON.stringify({ type, seq, time: 1, data: { turn: 1, ...extra } });
+
+	// (a) 含 packed 分片行的健康日志：loader 展开 seq0..seq0+dt.length 后连续 →
+	// 不得误报空洞（旧实现逐行取 seq 会把 packed 行当 gap）。
+	const packedLog = join(cdir, "packed-good.jsonl");
+	writeFileSync(packedLog, [
+		ev(0, "turn/start"), ev(1, "turn/end"),
+		JSON.stringify({ type: "text-chunks", seq0: 2, time0: 1, data: { turn: 1, step: 1, index: 1, dt: [1, 1], texts: ["a", "b"] } }),
+		ev(5, "turn/start", { turn: 2 }),
+	].join("\n") + "\n"); // packed 覆盖 2,3,4 → 连续 0..5
+	const { out } = runWith(doctor, ["--session", packedLog]);
+	assert(out.includes("会话 seq 连续"), "packed 行展开后连续 → 不误报", out.split("\n").filter((l) => l.includes("seq")).join(" | ") || "");
+
+	// (b) 损坏：洞 + 重复 + 引用自身/后续 + 悬空引用 → 全部报出
+	const badLog = join(cdir, "ref-bad.jsonl");
+	writeFileSync(badLog, [
+		ev(0, "a"), ev(1, "b"), ev(3, "c"),               // gap: 2
+		JSON.stringify({ type: "m", seq: 4, time: 1, data: { turn: 1 }, sourceEventSeqs: [5, 99] }), // 引用后续 5 + 悬空 99
+		ev(5, "d"),
+		JSON.stringify({ type: "n", seq: 6, time: 1, data: { turn: 1 }, surfaceOp: { op: "replace", start: 1, end: 99 } }), // surfaceOp.end 悬空
+	].join("\n") + "\n");
+	const { out: out2 } = runWith(doctor, ["--session", badLog]);
+	assert(out2.includes("seq 空洞"), "报出 seq 空洞", out2.split("\n").filter((l) => l.includes("seq 空洞")).join(" | "));
+	assert(out2.includes("引用自身/后续事件") || out2.includes("引用悬空"), "报出伴生引用损坏", out2.split("\n").filter((l) => l.includes("引用")).join(" | "));
+
+	// (c) --fix：原子修复（备份 + 重排 + 重映射）→ 复检全绿 + 文件可重读
+	const { out: out3 } = runWith(doctor, ["--session", badLog, "--fix"]);
+	assert(out3.includes("会话已修复"), "--fix 报告修复成功", out3.split("\n").filter((l) => l.includes("修复")).join(" | "));
+	assert(out3.includes("修复后") && out3.includes("会话 seq 连续"), "修复后复检全绿", out3.split("\n").filter((l) => l.includes("seq")).join(" | "));
+	const baks = readdirSync(cdir).filter((f) => f.includes(".bak-repair-"));
+	assert(baks.length === 1, "修复前备份存在（.bak-repair-*）", baks.join(", "));
+	const repaired = readFileSync(badLog, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+	const seqs = repaired.map((d) => d.seq);
+	const contiguous = seqs.every((s, i) => s === i);
+	const noSelfRef = repaired.every((d) =>
+		!(Array.isArray(d.sourceEventSeqs) && d.sourceEventSeqs.some((s) => s >= d.seq))
+		&& !(d.surfaceOp && (d.surfaceOp.start >= d.seq || d.surfaceOp.end >= d.seq)));
+	assert(contiguous, "修复后 seq 连续 0..N-1", seqs.join(","));
+	assert(noSelfRef, "修复后无自身/后续引用", "");
+	rmSync(sh, { recursive: true, force: true });
+}
+
 console.log("\n== T15: skill frontmatter 冒号陷阱（#1401/#936）==");
 {
 	const sh = makeHome();

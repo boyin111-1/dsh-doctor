@@ -28,7 +28,8 @@ node dsh-doctor/dsh-doctor.mjs
 ```bash
 dsh-doctor                # check all profiles
 dsh-doctor --profile web  # check only the web profile
-dsh-doctor --session <log># scan one session log (.jsonl.zstd / .jsonl) for dangling tool_calls
+dsh-doctor --session <log># scan one session log (.jsonl.zstd / .jsonl) for seq integrity + dangling tool_calls
+dsh-doctor --session <log> --fix  # atomically repair seq damage: renumber + remap references (backup kept)
 dsh-doctor --fix          # auto-relink file: deps whose target exists but is not linked
 dsh-doctor --verify-anchors           # confirm checks still match YOUR installed dsh
 dsh-doctor --verify-anchors <dir>     # ... or a specific dir (source checkout / install)
@@ -57,7 +58,7 @@ to vet a profile before switching to it.
 | 11 | `toolkit-plugins` persistence | `.mjs` global tools (host-composed) vs `host.js`/`client.js` dynamic-plugin sources (the `plugin_deploy` recovery prerequisite); an empty kit dir warns | — |
 | 12 | host ↔ profile `@deepseek-ai/*` version drift | a profile-top-level copy of a `dsh-*`/shared package whose version differs from the installed dsh → the module-local `TOOL_RUNTIME_SCHEDULER` Symbol mismatch that crashes **every** tool call with `Cannot read properties of undefined (reading 'prepare')` (or `cannot get property "tools" without inject` for shared libs); fix hint: delete the copy or `pnpm add @deepseek-ai/<pkg>@<installed>` | #1515 |
 | 13 | Windows sandbox schannel TLS | probes `curl.exe` HTTPS under the current token; `SEC_E_NO_CREDENTIALS (0x8009030e)` means the ACL-restricted token (workspace-write sandbox) breaks schannel — contradicting the sandbox doc's "network not restricted" claim; workaround: `danger-full-access` for network commands or a non-schannel client (Python/OpenSSL) | #1789 |
-| 14 | Session log `seq` integrity (`--session`) | `seq` gaps / duplicates / rewinds in `session.jsonl[.zstd]` — the exact corruptions the loader rejects with `corrupt session log: seq gap in committed region`, from unclean-exit replays, forced compaction, or concurrent writers; reports line numbers + expected/got | #1497, #1469, #1586, #1433, #1452, #1333, #1305, #1287 |
+| 14 | Session log `seq` integrity (`--session`) | `seq` gaps / duplicates / rewinds in `session.jsonl[.zstd]` — the exact corruptions the loader rejects with `corrupt session log: seq gap in committed region`, from unclean-exit replays, forced compaction, or concurrent writers; reports line numbers + expected/got. Also scans the companion compaction corruption the gap scan misses: `sourceEventSeqs` / `data.sourceEventSeq` / `surfaceOp.start/end` referencing the event itself, a later event, or a seq absent from the log. Decodes packed chunk rows like the loader, so packed logs do not false-positive. `--session <log> --fix` atomically repairs: renumbers remaining seqs (incl. packed `seq0`), remaps every seq reference, drops unmappable refs, demotes unrecoverable `surfaceOp` replace rows, then backup → temp file → loader-rule verification → rename | #1497, #1469, #1586, #1433, #1452, #1333, #1305, #1287 |
 | 15 | Skill frontmatter colon trap | `SKILL.md` frontmatter whose unquoted `description` contains ASCII `": "` → YAML parses it as a nested mapping, the skill is silently dropped from the catalog (only a `logger.warn`); scans `~/.dsh/skills` and preset `skills/`, suggests quoting | #1401, #1450, #936 |
 | 16 | Windows excluded port range | parses `netsh interface ipv4 show excludedportrange protocol=tcp`; flags when dsh's default port 3080 falls inside a Hyper-V/WSL2/Docker reserved band (bind fails with EACCES even as admin) and suggests `--port` | #1462 |
 | 17 | PATH tool availability | `node`/`pnpm`/`npm`/`zstd` resolvable from PATH — missing `node` silently breaks new-session creation (`env: node: No such file or directory`), missing `pnpm` breaks plugin install | #1270, #1772 |
@@ -157,6 +158,21 @@ cp cordis.patch.yml cordis.patch.yml.bak   # then edit/remove the bad insert
 
 dsh-doctor never rewrites your live profile without `--fix` being explicit, and even
 then only touches broken `file:` links.
+
+### `--session <log> --fix` — atomic session-log seq repair
+
+`--session <log> --fix` repairs seq-class damage (gaps / duplicates / rewinds /
+bad seq references) in one atomic write: it renumbers every remaining seq in
+appearance order (including packed chunk rows' `seq0`), remaps every seq
+reference (`sourceEventSeqs`, `data.sourceEventSeq`, `surfaceOp.start/end`),
+drops references whose target is gone, and demotes a `surfaceOp` replace row
+whose span can no longer be resolved to a plain event. The original file is
+kept as `<log>.bak-repair-<timestamp>`; the repaired bytes are written to a
+temp file, verified with the loader's own rule (decoded seqs contiguous, no
+self/later/dangling references), and only then renamed over the original.
+Verification failure or a write error leaves the original untouched. A repaired
+log loads again instead of failing with `corrupt session log: seq gap in
+committed region`.
 
 ## Runtime incident handbook
 
