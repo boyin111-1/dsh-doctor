@@ -30,6 +30,7 @@ dsh-doctor                # check all profiles
 dsh-doctor --profile web  # check only the web profile
 dsh-doctor --session <log># scan one session log (.jsonl.zstd / .jsonl) for dangling tool_calls
 dsh-doctor --fix          # auto-relink file: deps whose target exists but is not linked
+dsh-doctor --fix --force  # run --fix even when the anchor baseline reports decoupled checks
 dsh-doctor --verify-anchors           # confirm checks still match YOUR installed dsh
 dsh-doctor --verify-anchors <dir>     # ... or a specific dir (source checkout / install)
 dsh-doctor --check-update             # compare installed dsh vs npm registry latest
@@ -127,6 +128,14 @@ the checks can silently start mis-reporting. Three gates keep that visible:
    registry latest (`@deepseek-ai/dsh`), answering "local vs official, who's
    newer". Offline / registry-blocked degrades to a hint, never a failure.
    Upgrading? Run `--verify-anchors` afterwards.
+4. **`--fix` fail-closed gate.** If the anchor baseline reports the check logic
+   is decoupled from the installed dsh (anchors missing), `--fix` **aborts by
+   default** instead of auto-repairing from possibly-stale knowledge — an
+   auto-fix acting on outdated assumptions is worse than a false positive. A
+   deliberate `--fix --force` re-enables the repair after human review. (The
+   TUI patch itself additionally has its own token-level guard: it only
+   rewrites the file when the exact `import`/`throw` lines still match, and
+   backs up to `.bak` first.)
 
 Same rationale as before: most people run the npm build (`lib/*.js`), which
 can differ from the source repo in version or patch level, so the baseline is

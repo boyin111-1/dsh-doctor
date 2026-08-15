@@ -24,6 +24,7 @@
  *   T16 Windows 端口排除段（#1462）
  *   T17 锚点基线防漂移（版本漂移自动核对：脱节/仍有效/一致三场景）
  *   T18 --check-update（在线对比 npm registry，网络不可用降级）
+ *   T19 --fix 防漂移闸门（锚点脱节 fail-closed 中止 / --force 强制）
  */
 import { execFileSync, execSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync, existsSync, readdirSync } from "node:fs";
@@ -642,6 +643,82 @@ console.log("\n== T18: --check-update（在线对比 npm registry；网络不可
 		"--check-update 输出对比或降级提示", out.split("\n").filter((l) => l.includes("对比") || l.includes("官方") || l.includes("registry")).join(" | ") || "");
 	assert(code === 0, "--check-update 干净退出（code 0）", `code=${code}`);
 	rmSync(th, { recursive: true, force: true });
+}
+
+console.log("\n== T19: --fix 防漂移闸门（锚点脱节 → fail-closed 中止；--force 强制）==");
+{
+	// 复用假 dsh 安装布局：<home>/lib/node_modules/@deepseek-ai/dsh + bin，TUI 坏文件作可修复项
+	const fixSetup = (ver, withAnchors) => {
+		const h = makeHome();
+		const dshRoot = join(h, "lib", "node_modules", "@deepseek-ai", "dsh");
+		const scoped = join(dshRoot, "node_modules", "@deepseek-ai");
+		mkdirSync(scoped, { recursive: true });
+		writeFileSync(join(dshRoot, "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh", version: ver }, null, 2) + "\n");
+		const src = withAnchors
+			? { "dsh-session": `"tool/call"\n"tool/result"\n`, "dsh-tools": "readonly callId: CallId\n", "dsh-app-boot": "[installAnchor, join(profileDir, 'package.json')]\ndsh?.bundle?.patch\n" }
+			: { "dsh-session": "// new\n", "dsh-tools": "// new\n", "dsh-app-boot": "// new\n" };
+		for (const [pkg, s] of Object.entries(src)) {
+			const dir = join(scoped, pkg);
+			mkdirSync(join(dir, "lib"), { recursive: true });
+			mkdirSync(join(dir, "src"), { recursive: true });
+			writeFileSync(join(dir, "package.json"), JSON.stringify({ name: `@deepseek-ai/${pkg}`, version: ver, main: "lib/index.js" }, null, 2) + "\n");
+			writeFileSync(join(dir, "lib", "index.js"), s);
+			writeFileSync(join(dir, "src", "index.ts"), s);
+		}
+		const binDir = join(h, "bin");
+		mkdirSync(binDir, { recursive: true });
+		writeFileSync(join(binDir, "dsh"), "#!/usr/bin/env node\n");
+		const tuiFile = join(h, "profiles", "tui", "node_modules", "@earendil-works", "pi-tui", "dist", "tui-main-screen.js");
+		mkdirSync(dirname(tuiFile), { recursive: true });
+		writeFileSync(tuiFile,
+			'import { visibleWidth } from "./utils.js";\n' +
+			'function render() {\n  if (!isImage && visibleWidth(line) > width) {\n    throw new Error(errorMsg);\n  }\n}\n');
+		writeProfile(h, "web", {});
+		return { h, binDir, tuiFile };
+	};
+	const runFix = (h, binDir, args) => {
+		const sep = process.platform === "win32" ? ";" : ":";
+		try {
+			return execFileSync(process.execPath, [doctor, ...args], {
+				env: { ...process.env, DSH_HOME: h, PATH: binDir + sep + process.env.PATH },
+				encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"],
+			});
+		} catch (e) {
+			// doctor 发现 ✗ 时以非零码退出（脱节场景正是如此）——输出才是断言对象
+			return String(e.stdout ?? "") + String(e.stderr ?? "");
+		}
+	};
+
+	// (a) 正常基线 + --fix → 照常执行补丁
+	{
+		const { h, binDir, tuiFile } = fixSetup("0.1.0-rc.6", true);
+		const out = runFix(h, binDir, ["--fix"]);
+		assert(!out.includes("--fix 中止") && out.includes("补丁已重打"), "正常基线：--fix 照常执行",
+			out.split("\n").filter((l) => l.includes("--fix") || l.includes("补丁")).join(" | "));
+		assert(readFileSync(tuiFile, "utf-8").includes("truncateToWidth(line, width)"), "正常基线：补丁确实写入文件");
+		rmSync(h, { recursive: true, force: true });
+	}
+
+	// (b) 锚点脱节 + --fix → fail-closed 中止，不写文件
+	{
+		const { h, binDir, tuiFile } = fixSetup("0.1.0-rc.7", false);
+		const out = runFix(h, binDir, ["--fix"]);
+		assert(out.includes("--fix 中止") && out.includes("fail-closed"), "脱节：--fix 中止（fail-closed）",
+			out.split("\n").filter((l) => l.includes("中止")).join(" | "));
+		assert(!readFileSync(tuiFile, "utf-8").includes("truncateToWidth"), "脱节中止：未写任何文件");
+		assert(out.includes("自动修复：已中止"), "脱节中止：总结行体现", out.split("\n").filter((l) => l.includes("自动修复")).join(" | ") || "");
+		rmSync(h, { recursive: true, force: true });
+	}
+
+	// (c) 锚点脱节 + --fix --force → 用户显式授权，强制执行
+	{
+		const { h, binDir, tuiFile } = fixSetup("0.1.0-rc.7", false);
+		const out = runFix(h, binDir, ["--fix", "--force"]);
+		assert(!out.includes("--fix 中止") && out.includes("用户已显式授权"), "脱节+--force：不中止且标注强制",
+			out.split("\n").filter((l) => l.includes("--fix") || l.includes("授权")).join(" | "));
+		assert(out.includes("补丁已重打") && readFileSync(tuiFile, "utf-8").includes("truncateToWidth(line, width)"), "脱节+--force：补丁执行并写入");
+		rmSync(h, { recursive: true, force: true });
+	}
 }
 
 // 清理临时 home

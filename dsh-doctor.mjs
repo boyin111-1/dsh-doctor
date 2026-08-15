@@ -46,6 +46,8 @@ const profilesRoot = join(dshHome, "profiles");
 const args = process.argv.slice(2);
 const onlyProfile = args.includes("--profile") ? args[args.indexOf("--profile") + 1] : null;
 const fixMode = args.includes("--fix");
+// --force：锚点脱节时仍执行自动修复（默认 fail-closed，脱节则中止 --fix）
+const forceFix = args.includes("--force");
 const sessionArg = args.includes("--session") ? args[args.indexOf("--session") + 1] : null;
 const verifyAnchorsIdx = args.indexOf("--verify-anchors");
 const verifyAnchorsDir = verifyAnchorsIdx !== -1
@@ -105,6 +107,9 @@ let pass = 0, fail = 0, warn = 0;
 const fixableFileLinks = []; // { profileDir, name, target }
 const fixableTuiPatches = []; // { file }
 const fixed = [];
+// 防漂移状态：锚点是否已与当前 dsh 脱节（checkAnchorBaseline 设置）。
+// 脱节时 --fix 默认中止（fail-closed），避免基于过时认知自动改文件。
+let anchorsDecoupled = false;
 
 function report(icon, msg) {
 	console.log(`  ${icon} ${msg}`);
@@ -1081,6 +1086,7 @@ function checkAnchorBaseline() {
 		else { bad++; report("✗", `锚点缺失: ${r.name} —— 依赖它的检查 ${r.dependsOn.join("、")} 的结论已不可信`); }
 	}
 	if (bad > 0) {
+		anchorsDecoupled = true; // 防漂移：锚点脱节 → --fix 默认中止
 		report("✗", `锚点基线: ${bad}/${ANCHORS.length} 锚点缺失 —— 本工具检测逻辑已与当前 dsh 脱节；请人工核对官方源码并同步更新本工具，勿再依据 #6/#7/#9/#14 的旧结论`);
 	} else {
 		report("✓", `锚点基线: 版本漂移但 ${ANCHORS.length} 个锚点全部仍在，检测逻辑仍有效（建议确认官方版本间无行为变化）`);
@@ -1270,35 +1276,46 @@ console.log(`\n========== 结果: ${pass} ✓ / ${warn} ⚠ / ${fail} ✗ ======
 
 // ---- --fix 执行 ----
 if (fixMode) {
-	console.log("\n🔧 --fix 模式下执行的可自动修复项：");
-	if (fixableFileLinks.length === 0 && fixableTuiPatches.length === 0) {
-		console.log("  · 无可自动修复项。");
-	}
-	for (const { profileDir, name, target } of fixableFileLinks) {
-		console.log(`  · 重链 ${name} → ${target}`);
-		try {
-			execSync(`pnpm add file:${JSON.stringify(target)}`, {
-				cwd: profileDir,
-				stdio: "inherit",
-				env: { ...process.env, npm_config_yes: "true" },
-			});
-			fixed.push(name);
-			console.log(`    ✓ 重链成功: ${name}`);
-		} catch {
-			console.log(`    ✗ 重链失败（pnpm 非零退出），无改自动配置；可手动 cd ${profileDir} && pnpm add file:${target}`);
+	// 防漂移第 4 道闸：锚点脱节时自动修复默认中止（fail-closed）。
+	// 检测逻辑已与当前 dsh 脱节 → 工具对 dsh 行为的认知可能全错，
+	// 此时基于该认知的自动修复（含未来新增的 fixable 项）不能盲目执行；
+	// 显式 --force 表示用户知情并坚持修复。
+	if (anchorsDecoupled && !forceFix) {
+		console.log("\n🔧 --fix 中止：锚点基线显示检测逻辑已与当前 dsh 脱节（见上方 ✗）。");
+		console.log("    此时自动修复的判断可能基于过时认知，默认不执行任何改动（fail-closed）。");
+		console.log("    若已人工核对、确认修复目标无误，可显式 `--fix --force` 强制执行。");
+	} else {
+		if (anchorsDecoupled) console.log("\n🔧 --fix（--force 强制）：锚点虽脱节，用户已显式授权，继续执行自动修复。");
+		console.log("\n🔧 --fix 模式下执行的可自动修复项：");
+		if (fixableFileLinks.length === 0 && fixableTuiPatches.length === 0) {
+			console.log("  · 无可自动修复项。");
 		}
-	}
-	for (const { file } of fixableTuiPatches) {
-		console.log(`  · 重打 TUI 超宽行补丁: ${file}`);
-		try {
-			if (applyTuiPatch(file)) {
-				fixed.push("pi-tui 补丁");
-				console.log(`    ✓ 补丁已重打（原文件备份为 .bak）`);
-			} else {
-				console.log(`    ⚠ 补丁结构不匹配（import 行或 throw 行已变），未改动；请人工核对 ${file}`);
+		for (const { profileDir, name, target } of fixableFileLinks) {
+			console.log(`  · 重链 ${name} → ${target}`);
+			try {
+				execSync(`pnpm add file:${JSON.stringify(target)}`, {
+					cwd: profileDir,
+					stdio: "inherit",
+					env: { ...process.env, npm_config_yes: "true" },
+				});
+				fixed.push(name);
+				console.log(`    ✓ 重链成功: ${name}`);
+			} catch {
+				console.log(`    ✗ 重链失败（pnpm 非零退出），无改自动配置；可手动 cd ${profileDir} && pnpm add file:${target}`);
 			}
-		} catch (e) {
-			console.log(`    ✗ 打补丁失败: ${e.message}`);
+		}
+		for (const { file } of fixableTuiPatches) {
+			console.log(`  · 重打 TUI 超宽行补丁: ${file}`);
+			try {
+				if (applyTuiPatch(file)) {
+					fixed.push("pi-tui 补丁");
+					console.log(`    ✓ 补丁已重打（原文件备份为 .bak）`);
+				} else {
+					console.log(`    ⚠ 补丁结构不匹配（import 行或 throw 行已变），未改动；请人工核对 ${file}`);
+				}
+			} catch (e) {
+				console.log(`    ✗ 打补丁失败: ${e.message}`);
+			}
 		}
 	}
 }
@@ -1313,5 +1330,9 @@ if (fail > 0) {
 	console.log("  4. 仍无法启动：备份后停止用坏 profile，用 `--profile <其他>` 启动再定位");
 }
 
-console.log(`\n${fixMode ? "自动修复：" + (fixed.length ? `${fixed.join(", ")} 已重链 ✓` : "本次无需重链（或全部失败）") : "用 --fix 自动重链 file: 依赖"}`);
+console.log(`\n${fixMode
+	? (anchorsDecoupled && !forceFix
+		? "自动修复：已中止（锚点脱节，fail-closed；--fix --force 可强制）"
+		: "自动修复：" + (fixed.length ? `${fixed.join(", ")} 已重链 ✓` : "本次无需重链（或全部失败）"))
+	: "用 --fix 自动重链 file: 依赖"}`);
 process.exit(fail > 0 ? 1 : 0);
