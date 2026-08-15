@@ -33,11 +33,22 @@
  */
 
 import { createRequire } from "node:module";
-import { existsSync, readFileSync, readdirSync, lstatSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, lstatSync, realpathSync, writeFileSync, copyFileSync, renameSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
 import { get as httpsGet } from "node:https";
+
+// Node 22.18+ 内置 zstd（dsh 要求 node ^22.19 || >=24）；读取与写回都优先用它，
+// 缺失时读取降级为 zstd CLI（check 17 探测 PATH），再缺失则 --session 的
+// zstd 会话检查/修复不可用并明确提示。
+let zstdCompressSync = null, zstdDecompressSync = null, zstdChecksumFlag = 1;
+try {
+	const z = await import("node:zlib");
+	zstdCompressSync = z.zstdCompressSync ?? null;
+	zstdDecompressSync = z.zstdDecompressSync ?? null;
+	zstdChecksumFlag = z.constants?.ZSTD_c_checksumFlag ?? 1;
+} catch { /* 旧 Node：zstd 能力不可用 */ }
 
 const dshHome = (process.env.DSH_HOME && process.env.DSH_HOME.trim())
 	? process.env.DSH_HOME.trim()
@@ -564,9 +575,31 @@ function extractInsertIds(ymlPath) {
 }
 
 /**
- * 部署 zstd 解码会话日志（`session.jsonl.zstd`）。找不到 zstd 时返回 null（降级跳过）。
+ * 部署 zstd 解码会话日志（`session.jsonl.zstd`）。优先 Node 内置 zstd（多帧
+ * 拼接，与官方 `.zstd` 布局一致），再回退 `zstd -dc`；都不可用时返回 null
+ * （降级跳过）。
  */
 function zstdDecode(filePath) {
+	if (zstdDecompressSync !== null) {
+		try {
+			const buf = readFileSync(filePath);
+			const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+			const frames = [];
+			let i = 0;
+			while (i < buf.length) {
+				const idx = buf.indexOf(magic, i);
+				if (idx === -1) break;
+				const next = buf.indexOf(magic, idx + 4);
+				const end = next === -1 ? buf.length : next;
+				frames.push(buf.subarray(idx, end));
+				i = end;
+			}
+			if (frames.length === 0) return null;
+			return frames.map((f) => zstdDecompressSync(f).toString("utf8")).join("");
+		} catch {
+			// fall through to the zstd CLI
+		}
+	}
 	try {
 		return execSync(`zstd -dc ${JSON.stringify(filePath)}`, { encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 });
 	} catch {
@@ -634,6 +667,53 @@ function checkSessionOrphanToolCalls(sessionPath, display) {
 }
 
 /**
+ * 解析会话日志为事件流——与 loader 一致（SessionLogScanner.consumeEventLine）：
+ * packed 分片行（text-chunks / reasoning-chunks / tool-call-chunks）展开为
+ * seq0..seq0+dt.length 的成员事件，普通事件取 d.seq。header 行跳过。
+ * 零依赖，只做结构解析。
+ *
+ * @param {string} raw - 解码后的 JSONL 文本。
+ * @returns {{ events: Array, present: Set<number>, maxSeq: number }}
+ *   events 每项: { seq, type, line, src?, srcOne?, surfaceOp? }
+ *   src = d.sourceEventSeqs；srcOne = d.data.sourceEventSeq；surfaceOp = d.surfaceOp。
+ */
+function parseSessionLog(raw) {
+	const events = [];
+	const present = new Set();
+	let maxSeq = -1, line = 0;
+	for (const l of raw.split("\n")) {
+		line++;
+		if (!l.trim()) continue;
+		let d;
+		try { d = JSON.parse(l); } catch { continue; }
+		if (d && typeof d === "object" && d.type === "session") continue;
+		if (d && typeof d === "object" && (d.type === "text-chunks" || d.type === "reasoning-chunks" || d.type === "tool-call-chunks")) {
+			const count = (d.data && Array.isArray(d.data.dt) ? d.data.dt.length : 0) + 1;
+			for (let i = 0; i < count; i++) {
+				const seq = d.seq0 + i;
+				events.push({ seq, type: d.type, line, packed: true });
+				present.add(seq);
+				if (seq > maxSeq) maxSeq = seq;
+			}
+			continue;
+		}
+		const seq = d.seq;
+		if (!Number.isInteger(seq)) continue;
+		events.push({
+			seq,
+			type: d.type,
+			line,
+			src: Array.isArray(d.sourceEventSeqs) ? d.sourceEventSeqs : undefined,
+			srcOne: typeof (d.data ?? {})?.sourceEventSeq === "number" ? d.data.sourceEventSeq : undefined,
+			surfaceOp: d.surfaceOp && typeof d.surfaceOp === "object" ? d.surfaceOp : undefined,
+		});
+		present.add(seq);
+		if (seq > maxSeq) maxSeq = seq;
+	}
+	return { events, present, maxSeq };
+}
+
+/**
  * 会话日志 seq 完整性检测（#1497/#1469/#1586/#1452/#1433/#1333/#1305/#1287/#1299）。
  *
  * dsh 的 SessionLogScanner.consumeEventLine 要求每个事件的 `seq` 与它在日志中的
@@ -644,8 +724,10 @@ function checkSessionOrphanToolCalls(sessionPath, display) {
  * 任何一种都会让加载器报 `corrupt session log: seq gap in committed region`，
  * 整段历史永久不可加载（#1047/#1473：单个坏日志还能让 session.list 整体 500）。
  *
- * 本检查只做只读扫描：解压 → 逐行核对 seq 连续性 → 报告具体行号与
- * expected/got，帮助在打开会话前先判断日志是否已损坏、损坏在哪一行。
+ * 本检查与 loader 同样先展开 packed 分片行再核对连续性（避免对含 packed 行的
+ * 正常日志误报），并额外扫描压缩的伴生损坏——seq 引用（sourceEventSeqs /
+ * data.sourceEventSeq / surfaceOp.start/end）指向自身、后续事件或日志中不存在的
+ * 事件（压缩折叠后未重映射引用的典型形态）。
  *
  * @param sessionPath - `session.jsonl.zstd` / 明文 `.jsonl` 文件路径。
  * @param display - 会话显示名。
@@ -656,23 +738,32 @@ function checkSessionSeqIntegrity(sessionPath, display) {
 		report("⚠", `会话不可读/无 zstd: ${display}（跳过 seq 完整性检查）`);
 		return;
 	}
-	let expected = 0, line = 0, issues = 0, events = 0;
+	const { events, present } = parseSessionLog(raw);
+	let expected = 0, issues = 0;
 	const gaps = [], dupes = [], rewind = [];
-	for (const l of raw.split("\n")) {
-		line++;
-		if (!l.trim()) continue;
-		let d;
-		try { d = JSON.parse(l); } catch { continue; }
-		const seq = d.seq;
-		if (!Number.isInteger(seq)) continue;
-		events++;
-		if (seq === expected) { expected++; continue; }
-		if (seq > expected) { gaps.push(`L${line} seq ${expected}→${seq}（缺 ${seq - expected}）`); expected = seq + 1; issues++; }
-		else if (seq === expected - 1) { /* 重复的旧 seq 也计问题 */ dupes.push(`L${line} seq ${seq} 重复`); issues++; }
-		else { rewind.push(`L${line} seq ${seq} 倒退（已见 ${expected - 1}）`); issues++; }
+	for (const e of events) {
+		if (e.seq === expected) { expected++; continue; }
+		if (e.seq > expected) { gaps.push(`L${e.line} seq ${expected}→${e.seq}（缺 ${e.seq - expected}）`); expected = e.seq + 1; issues++; }
+		else if (e.seq === expected - 1) { /* 重复的旧 seq 也计问题 */ dupes.push(`L${e.line} seq ${e.seq} 重复`); issues++; }
+		else { rewind.push(`L${e.line} seq ${e.seq} 倒退（已见 ${expected - 1}）`); issues++; }
 	}
-	if (issues === 0) {
-		report("✓", `会话 seq 连续: ${display}（${events} 事件无 gap/重复）`);
+	// 伴生损坏：seq 引用指向自身/后续事件，或指向日志中不存在的事件（悬空）。
+	const selfRefs = [], danglingRefs = [];
+	for (const e of events) {
+		const refs = [];
+		if (e.src) for (const s of e.src) refs.push([s, "sourceEventSeqs"]);
+		if (e.srcOne !== undefined) refs.push([e.srcOne, "data.sourceEventSeq"]);
+		if (e.surfaceOp) {
+			if (Number.isInteger(e.surfaceOp.start)) refs.push([e.surfaceOp.start, "surfaceOp.start"]);
+			if (Number.isInteger(e.surfaceOp.end)) refs.push([e.surfaceOp.end, "surfaceOp.end"]);
+		}
+		for (const [s, field] of refs) {
+			if (s >= e.seq) selfRefs.push(`L${e.line} seq=${e.seq} ${field}=${s} 引用自身/后续事件`);
+			else if (!present.has(s)) danglingRefs.push(`L${e.line} seq=${e.seq} ${field}=${s} 悬空（日志中不存在该 seq）`);
+		}
+	}
+	if (issues === 0 && selfRefs.length === 0 && danglingRefs.length === 0) {
+		report("✓", `会话 seq 连续: ${display}（${events.length} 事件无 gap/重复/坏引用）`);
 		return;
 	}
 	const MAX_SHOW = 4;
@@ -680,6 +771,158 @@ function checkSessionSeqIntegrity(sessionPath, display) {
 	if (gaps.length) report("✗", `会话 seq 空洞: ${display} — ${show(gaps)}（#1469/#1497 压缩/崩溃后未重排 seq，加载器将报 corrupt session log）`);
 	if (dupes.length) report("✗", `会话 seq 重复: ${display} — ${show(dupes)}（#1497/#1287 崩溃重放已提交事件）`);
 	if (rewind.length) report("✗", `会话 seq 倒退: ${display} — ${show(rewind)}（#1433/#1452/#1586 并发写/重放导致 seq 撞号）`);
+	if (selfRefs.length) report("✗", `会话 seq 引用错乱: ${display} — ${show(selfRefs)}（压缩折叠后未重映射引用，sourceEventSeqs 指向自身/后续事件）`);
+	if (danglingRefs.length) report("✗", `会话 seq 引用悬空: ${display} — ${show(danglingRefs)}（压缩折叠删除了被引用事件但未重映射）`);
+}
+
+/** 用 Node 内置 zstd（带 checksum 标志）编码一帧 JSONL；不可用时返回 null。 */
+function zstdEncodeFrame(text) {
+	if (zstdCompressSync === null) return null;
+	try {
+		return zstdCompressSync(Buffer.from(text, "utf8"), { params: { [zstdChecksumFlag]: 1 } });
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * 原子修复会话日志的 seq 类损坏（#1497/#1469 族）——实现"压缩写入路径"的正确
+ * 修复语义：按出现顺序重排全部 seq（含 packed 行 seq0 与成员），并全量重映射
+ * seq 引用（sourceEventSeqs / data.sourceEventSeq / surfaceOp.start/end）。
+ * 无法映射的悬空引用剔除；surfaceOp 语义无法保持的事件降级为普通事件（被删
+ * 节点已不在日志中，保留 replace 声明只会继续悬空）。
+ *
+ * 写回严格原子：备份原文件 → 写临时文件 → 用 loader 规则（展开后 seq 连续、
+ * 无自身/后续/悬空引用）校验通过 → rename 替换；校验不过或写失败均不触碰
+ * 原文件（备份保留，供人工复查）。
+ *
+ * @param {string} sessionPath - 会话日志路径。
+ * @returns {boolean} 是否成功写回。
+ */
+function repairSessionLog(sessionPath) {
+	const isZstd = /\.zstd$/.test(sessionPath);
+	const raw = isZstd ? zstdDecode(sessionPath) : (existsSync(sessionPath) ? readFileSync(sessionPath, "utf-8") : null);
+	if (raw === null) {
+		report("⚠", `会话不可读/无 zstd: ${sessionPath}（跳过修复）`);
+		return false;
+	}
+
+	// 1) 按出现顺序分配新 seq（展开事件流；packed 行成员在行内连续出现）。
+	const lines = raw.split("\n");
+	const seqFor = new Map(); // oldSeq -> newSeq
+	let next = 0, eventCount = 0, packedRows = 0;
+	for (const l of lines) {
+		if (!l.trim()) continue;
+		let d;
+		try { d = JSON.parse(l); } catch { continue; }
+		if (d && typeof d === "object" && d.type === "session") continue;
+		if (d && typeof d === "object" && (d.type === "text-chunks" || d.type === "reasoning-chunks" || d.type === "tool-call-chunks")) {
+			const count = (d.data && Array.isArray(d.data.dt) ? d.data.dt.length : 0) + 1;
+			for (let i = 0; i < count; i++) {
+				if (!seqFor.has(d.seq0 + i)) seqFor.set(d.seq0 + i, next);
+				next++;
+			}
+			packedRows++;
+			continue;
+		}
+		const seq = d?.seq;
+		if (!Number.isInteger(seq)) continue;
+		if (!seqFor.has(seq)) seqFor.set(seq, next);
+		next++;
+		eventCount++;
+	}
+
+	// 2) 重写行：新 seq 按行序独立分配（重复 seq 的每一行都拿到唯一新 seq；
+	//    seqFor 只记录每个旧 seq 的首次映射，供引用重映射使用）。
+	const out = [];
+	let nextSeq = 0, droppedRefs = 0, demotedSurface = 0;
+	for (const l of lines) {
+		if (!l.trim()) { out.push(l); continue; }
+		let d;
+		try { d = JSON.parse(l); } catch { out.push(l); continue; }
+		if (d && typeof d === "object" && d.type === "session") { out.push(l); continue; }
+		if (d && typeof d === "object" && (d.type === "text-chunks" || d.type === "reasoning-chunks" || d.type === "tool-call-chunks")) {
+			const count = (d.data && Array.isArray(d.data.dt) ? d.data.dt.length : 0) + 1;
+			d.seq0 = nextSeq;
+			nextSeq += count;
+			out.push(JSON.stringify(d));
+			continue;
+		}
+		const seq = d?.seq;
+		if (!Number.isInteger(seq)) { out.push(l); continue; }
+		d.seq = nextSeq++;
+		// sourceEventSeqs：重映射；目标已不在日志中或映射后 ≥ 自身（引用后续
+		// 事件本身即损坏）的引用剔除。
+		if (Array.isArray(d.sourceEventSeqs)) {
+			const mapped = d.sourceEventSeqs.map((s) => seqFor.get(s)).filter((s) => s !== undefined && s < d.seq);
+			droppedRefs += d.sourceEventSeqs.length - mapped.length;
+			if (mapped.length === 0) delete d.sourceEventSeqs;
+			else d.sourceEventSeqs = mapped;
+		}
+		// data.sourceEventSeq（command/done）：同上。
+		if (d.data && typeof d.data === "object" && typeof d.data.sourceEventSeq === "number") {
+			const m = seqFor.get(d.data.sourceEventSeq);
+			if (m === undefined || m >= d.seq) { delete d.data.sourceEventSeq; droppedRefs++; }
+			else d.data.sourceEventSeq = m;
+		}
+		// surfaceOp.start/end：重映射；任一目标缺失或映射后 ≥ 自身则降级为普通事件。
+		if (d.surfaceOp && typeof d.surfaceOp === "object") {
+			const start = Number.isInteger(d.surfaceOp.start) ? seqFor.get(d.surfaceOp.start) : undefined;
+			const end = Number.isInteger(d.surfaceOp.end) ? seqFor.get(d.surfaceOp.end) : undefined;
+			if (start === undefined || end === undefined || start >= d.seq || end >= d.seq) {
+				delete d.surfaceOp;
+				delete d.sourceEventSeqs; // 降级为普通事件：replace 语义已无法保持
+				demotedSurface++;
+			} else {
+				d.surfaceOp.start = start;
+				d.surfaceOp.end = end;
+			}
+		}
+		out.push(JSON.stringify(d));
+	}
+	const repairedText = out.join("\n");
+
+	// 3) 校验（loader 规则：展开后 seq === index；引用 < 自身且目标存在）。
+	const { events, present } = parseSessionLog(repairedText);
+	let badSeq = 0, expected = 0;
+	for (const e of events) { if (e.seq !== expected) badSeq++; expected++; }
+	let badRef = 0;
+	for (const e of events) {
+		const refs = [];
+		if (e.src) for (const s of e.src) refs.push(s);
+		if (e.srcOne !== undefined) refs.push(e.srcOne);
+		if (e.surfaceOp) { refs.push(e.surfaceOp.start, e.surfaceOp.end); }
+		for (const s of refs) if (s >= e.seq || !present.has(s)) badRef++;
+	}
+	if (badSeq !== 0 || badRef !== 0) {
+		report("✗", `修复校验失败（${badSeq} 处不连续 / ${badRef} 处坏引用），未写回: ${sessionPath}`);
+		return false;
+	}
+
+	// 4) 备份 + 临时文件 + rename 原子写回。
+	const backup = `${sessionPath}.bak-repair-${Date.now()}`;
+	try {
+		copyFileSync(sessionPath, backup);
+		const tmp = `${sessionPath}.repair-tmp`;
+		if (isZstd) {
+			const headerEnd = repairedText.indexOf("\n") + 1;
+			const headerFrame = zstdEncodeFrame(repairedText.slice(0, headerEnd));
+			const bodyFrame = zstdEncodeFrame(repairedText.slice(headerEnd));
+			if (headerFrame === null || bodyFrame === null) {
+				report("✗", `zstd 编码不可用（Node 需 ≥22.18 或安装 zstd CLI），未写回: ${sessionPath}（备份已保留: ${backup}）`);
+				return false;
+			}
+			writeFileSync(tmp, Buffer.concat([headerFrame, bodyFrame]));
+		} else {
+			writeFileSync(tmp, repairedText, "utf-8");
+		}
+		renameSync(tmp, sessionPath);
+	} catch (e) {
+		report("✗", `修复写回失败（备份已保留 ${backup}）: ${String(e?.message ?? e)}`);
+		return false;
+	}
+	report("✓", `会话已修复: ${sessionPath}（重排 ${eventCount} 事件${packedRows ? ` / ${packedRows} 个 packed 行` : ""}${droppedRefs ? ` / 剔除 ${droppedRefs} 个悬空引用` : ""}${demotedSurface ? ` / 降级 ${demotedSurface} 个 surfaceOp` : ""}；备份: ${backup}）`);
+	return true;
 }
 
 /** 检测 dsh.profile.bundles 完整性（#917/#880/#1197 族；advisory 分辨率锚点）。 */
@@ -1224,7 +1467,8 @@ if (checkUpdateIdx !== -1) {
 	process.exit(0);
 }
 
-// --session 模式：扫单个会话文件（#1544/#1363 悬空 tool_call）
+// --session 模式：扫单个会话文件（#1544/#1363 悬空 tool_call + #1497 族 seq 完整性）
+// 加 --fix 时先诊断、再原子修复 seq 类损坏、最后复检。
 if (sessionArg) {
 	const sp = sessionArg;
 	if (!existsSync(sp)) {
@@ -1235,6 +1479,14 @@ if (sessionArg) {
 	const display = basename(sp).replace(/\.jsonl\.zstd$/, "").slice(-24);
 	checkSessionOrphanToolCalls(sp, display);
 	checkSessionSeqIntegrity(sp, display);
+	if (fixMode) {
+		console.log("\n🔧 修复模式: 重排 seq + 重映射引用（备份 → 临时文件 → 校验 → 替换）");
+		if (repairSessionLog(sp)) {
+			// 复检：清空统计只看修复后的 seq 完整性
+			pass = 0; fail = 0; warn = 0;
+			checkSessionSeqIntegrity(sp, display + "（修复后）");
+		}
+	}
 	console.log(`\n========== 结果: ${pass} ✓ / ${warn} ⚠ / ${fail} ✗ ==========`);
 	process.exit(fail > 0 ? 1 : 0);
 }
