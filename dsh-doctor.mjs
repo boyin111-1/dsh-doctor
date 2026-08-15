@@ -17,12 +17,13 @@
  *   node dsh-doctor.mjs --session <log>     # 扫会话日志里的悬空 tool_call（#1544/#1363）
  *   node dsh-doctor.mjs --verify-anchors <dshRepo>  # 核对检测锚点是否仍与官方源码一致
  *   DSH_HOME=/path dsh-doctor.mjs  # 指定 Harness home（默认 ~/.dsh）
- *   node dsh-doctor.mjs 检查项 ≥9 类：悬空引用 / file:链接 / 重复id /
- *      入口产物 / 双实例 / bundles完整性 / bundle-id碰撞 / bundle冗余insert / 会话孤儿tool_call
+ *   node dsh-doctor.mjs 检查项 ≥11 类：悬空引用 / file:链接 / 重复id /
+ *      入口产物 / 双实例 / bundles完整性 / bundle-id碰撞 / bundle冗余insert /
+ *      会话孤儿tool_call / TUI超宽行崩溃补丁 / toolkit-plugins持久化插件源码
  */
 
 import { createRequire } from "node:module";
-import { existsSync, readFileSync, readdirSync, lstatSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, lstatSync, realpathSync, writeFileSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
@@ -42,6 +43,7 @@ const verifyAnchorsDir = verifyAnchorsIdx !== -1
 
 let pass = 0, fail = 0, warn = 0;
 const fixableFileLinks = []; // { profileDir, name, target }
+const fixableTuiPatches = []; // { file }
 const fixed = [];
 
 function report(icon, msg) {
@@ -115,10 +117,35 @@ function checkDuplicateIds(profileDir) {
  *
  * `dsh` 不在 PATH 时回退到常见全局布局 glob。返回 dsh 包根目录，找不到返回 null。
  */
+/** 展开只含单个 `*` 段的 glob（POSIX ls 的 Windows 替代），返回第一个存在的完整路径或 null。 */
+function expandFirstGlob(pattern) {
+	const parts = pattern.split("/");
+	let cur = parts[0] === "$HOME" ? homedir() : parts[0];
+	for (let i = 1; i < parts.length; i++) {
+		if (parts[i] === "*") {
+			try {
+				for (const child of readdirSync(cur)) {
+					const cand = join(cur, child, ...parts.slice(i + 1));
+					if (existsSync(cand)) return cand;
+				}
+			} catch { /* keep looking */ }
+			return null;
+		}
+		cur = join(cur, parts[i]);
+	}
+	return existsSync(cur) ? cur : null;
+}
+
+/**
+ * 定位 dsh 安装根（@deepseek-ai/dsh 包目录）。先探测 PATH 里的 dsh 可执行文件
+ * （Windows 用 `where`，POSIX 用 `command -v`），找不到再回退到常见全局布局
+ * glob。返回包根目录，找不到返回 null。
+ */
 function findDshInstall() {
 	try {
-		const bin = execSync("command -v dsh", { encoding: "utf-8" }).trim();
-		if (bin && (bin.startsWith("/") || bin.includes("/"))) {
+		const which = process.platform === "win32" ? "where dsh" : "command -v dsh";
+		const bin = execSync(which, { encoding: "utf-8" }).trim().split(/\r?\n/)[0];
+		if (bin && (bin.startsWith("/") || bin.includes("/") || /^[A-Za-z]:[\\/]/.test(bin))) {
 			let real = bin;
 			try { real = realpathSync(bin); } catch { /* keep symlink path */ }
 			let dir = dirname(real);
@@ -133,16 +160,14 @@ function findDshInstall() {
 				dir = dirname(dir);
 			}
 		}
-	} catch { /* command -v failed */ }
+	} catch { /* where/command -v failed */ }
 	const globs = [
 		"$HOME/.nvm/versions/node/*/lib/node_modules/@deepseek-ai/dsh",
 		"$HOME/.local/share/pnpm/global/*/node_modules/@deepseek-ai/dsh",
 	];
 	for (const g of globs) {
-		try {
-			const out = execSync(`ls -d ${g} 2>/dev/null | head -1`, { encoding: "utf-8" }).trim();
-			if (out) return out;
-		} catch { /* keep looking */ }
+		const hit = expandFirstGlob(g);
+		if (hit) return hit;
 	}
 	return null;
 }
@@ -454,6 +479,51 @@ function checkFileLinks(profileDir, pkgName) {
 	}
 }
 
+/** 检查 pi-tui 超宽行崩溃补丁是否在位。
+ * 背景：@earendil-works/pi-tui 的 tui-main-screen.js 在渲染超宽行时
+ * `throw new Error(errorMsg)` 直接杀掉整个 pi 进程（我们实测过：一次超长
+ * 中文行就把进程搞崩，还连累进行中的工具调用）。修复是把它换成
+ * `truncateToWidth(line, width)` 截断。补丁打在 node_modules 里，
+ * pi-tui 升级会被覆盖 —— 本 check 检测补丁是否仍在，`--fix` 可重打。
+ */
+function checkTuiPatch() {
+	const tuiDir = join(profilesRoot, "tui");
+	const tuiFile = join(tuiDir, "node_modules", "@earendil-works", "pi-tui", "dist", "tui-main-screen.js");
+	if (!existsSync(tuiFile)) return; // 无 TUI profile 或该版本无此文件 → 跳过
+	let src;
+	try { src = readFileSync(tuiFile, "utf8"); } catch { return; }
+	const patched = src.includes("truncateToWidth(line, width)");
+	const oldCrash = src.includes("throw new Error(errorMsg);");
+	if (patched) {
+		report("✓", `TUI 超宽行补丁在位: pi-tui（超宽行截断而非杀进程）`);
+	} else if (oldCrash) {
+		report("✗", `TUI 超宽行崩溃补丁缺失: pi-tui 仍是「超宽即 throw 杀进程」${fixMode ? "" : "（升级可能覆盖了补丁；用 --fix 重打）"}`);
+		if (fixMode) fixableTuiPatches.push({ file: tuiFile });
+	} else {
+		report("⚠", `TUI 渲染文件结构未知: pi-tui 既无补丁也无旧崩溃代码（版本可能已改结构）`);
+	}
+}
+
+/** 给 pi-tui 打超宽行截断补丁（token 级替换，对版本变化鲁棒），返回是否改动。 */
+function applyTuiPatch(file) {
+	const src = readFileSync(file, "utf8");
+	let out = src;
+	let changed = false;
+	if (!out.includes("truncateToWidth") && out.includes('import { visibleWidth } from "./utils.js";')) {
+		out = out.replace('import { visibleWidth } from "./utils.js";', 'import { visibleWidth, truncateToWidth } from "./utils.js";');
+		changed = true;
+	}
+	if (out.includes("throw new Error(errorMsg);")) {
+		out = out.replace("throw new Error(errorMsg);", "line = truncateToWidth(line, width); // [dsh-doctor] 超宽行截断替代崩溃");
+		changed = true;
+	}
+	if (changed) {
+		writeFileSync(file + ".bak", src); // 备份
+		writeFileSync(file, out);
+	}
+	return changed;
+}
+
 /** 检查一个 profile */
 function checkProfile(dir) {
 	const profileName = dir.split("/").pop();
@@ -526,21 +596,64 @@ function checkProfile(dir) {
 
 	// 9. bundle 与用户 patch id 碰撞检测（advisory item (a)；#1404/#1479）
 	checkBundleIdCollision(profileDir, installAnchor);
+
+	// 10. toolkit-plugins 持久化动态插件源码完整性（plugin_deploy 恢复的前提）
+	const tkDir = join(profileDir, "toolkit-plugins");
+	if (existsSync(tkDir)) {
+		const kits = readdirSync(tkDir).filter((k) => {
+			try { return lstatSync(join(tkDir, k)).isDirectory(); } catch { return false; }
+		});
+		for (const kit of kits) {
+			const hasMjs = existsSync(join(tkDir, kit, "index.mjs"));
+			const hasHost = existsSync(join(tkDir, kit, "host.js"));
+			const hasClient = existsSync(join(tkDir, kit, "client.js"));
+			if (hasMjs) {
+				report("✓", `全局工具插件: ${kit}（index.mjs，host 组合加载，重启自动生效）`);
+			} else if (hasHost || hasClient) {
+				report("✓", `持久化动态插件源码: ${kit}（host:${hasHost ? "有" : "无"} client:${hasClient ? "有" : "无"}；重启后用 plugin_deploy 恢复）`);
+			} else {
+				report("⚠", `持久化插件目录异常: ${kit}（无 index.mjs / host.js / client.js，plugin_deploy 无法恢复）`);
+			}
+		}
+	}
 }
 
-/** 深度扫描某目录下源码/编译文件是否包含某 token。fixed=true 用 grep -F（字面量，避免元字符转义坑）。 */
+/** 转义正则元字符（fixed 字面量匹配用）。 */
+function escapeRegExp(s) {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** 简单 glob（仅 `*`）转正则：*.js → ^.*\.js$。 */
+function globToRegExp(glob) {
+	return new RegExp("^" + glob.split("*").map(escapeRegExp).join(".*") + "$");
+}
+
+/** 深度扫描某目录下源码/编译文件是否包含某 token。
+ * 纯 Node 递归实现（Windows 无 grep，POSIX 的 grep -r 也不跟随 symlink，
+ * 这里用 lstatSync 同样跳过符号链接以免循环）。fixed=true 时 token 按字面量匹配。 */
 function deepInspectContains(root, filenamePattern, token, fixed = false) {
-	const flavor = fixed ? "-rlF" : "-rlE";
-	const t = fixed ? token.replace(/\n/g, "\\n") : token;
-	try {
-		const out = execSync(
-			`grep ${flavor} --include="${filenamePattern}" "${t}" "${root}" 2>/dev/null | head -5`,
-			{ encoding: "utf-8" },
-		);
-		return out.trim().length > 0;
-	} catch {
-		return false;
-	}
+	const needle = fixed ? token : new RegExp(token);
+	const fileRe = globToRegExp(filenamePattern);
+	let hits = 0;
+	const walk = (dir) => {
+		if (hits >= 5) return;
+		let entries;
+		try { entries = readdirSync(dir); } catch { return; }
+		for (const child of entries) {
+			if (hits >= 5) return;
+			const full = join(dir, child);
+			let st;
+			try { st = lstatSync(full); } catch { continue; }
+			if (st.isDirectory()) { walk(full); continue; }
+			if (!st.isFile() || !fileRe.test(child)) continue;
+			try {
+				const content = readFileSync(full, "utf8");
+				if (fixed ? content.includes(token) : needle.test(content)) hits++;
+			} catch { /* 不可读/非文本文件跳过 */ }
+		}
+	};
+	walk(root);
+	return hits > 0;
 }
 
 /**
@@ -689,27 +802,42 @@ const profiles = readdirSync(profilesRoot)
 
 for (const p of profiles) checkProfile(join(profilesRoot, p));
 
+// 额外：TUI profile 的超宽行崩溃补丁完整性（不属于 profile 清单检查，单独跑）
+checkTuiPatch();
+
 console.log(`\n========== 结果: ${pass} ✓ / ${warn} ⚠ / ${fail} ✗ ==========`);
 
 // ---- --fix 执行 ----
 if (fixMode) {
 	console.log("\n🔧 --fix 模式下执行的可自动修复项：");
-	if (fixableFileLinks.length === 0) {
-		console.log("  · 无 file: 链接失效（target 存在但未链接）需要重链。");
-	} else {
-		for (const { profileDir, name, target } of fixableFileLinks) {
-			console.log(`  · 重链 ${name} → ${target}`);
-			try {
-				execSync(`pnpm add file:${JSON.stringify(target)}`, {
-					cwd: profileDir,
-					stdio: "inherit",
-					env: { ...process.env, npm_config_yes: "true" },
-				});
-				fixed.push(name);
-				console.log(`    ✓ 重链成功: ${name}`);
-			} catch {
-				console.log(`    ✗ 重链失败（pnpm 非零退出），无改自动配置；可手动 cd ${profileDir} && pnpm add file:${target}`);
+	if (fixableFileLinks.length === 0 && fixableTuiPatches.length === 0) {
+		console.log("  · 无可自动修复项。");
+	}
+	for (const { profileDir, name, target } of fixableFileLinks) {
+		console.log(`  · 重链 ${name} → ${target}`);
+		try {
+			execSync(`pnpm add file:${JSON.stringify(target)}`, {
+				cwd: profileDir,
+				stdio: "inherit",
+				env: { ...process.env, npm_config_yes: "true" },
+			});
+			fixed.push(name);
+			console.log(`    ✓ 重链成功: ${name}`);
+		} catch {
+			console.log(`    ✗ 重链失败（pnpm 非零退出），无改自动配置；可手动 cd ${profileDir} && pnpm add file:${target}`);
+		}
+	}
+	for (const { file } of fixableTuiPatches) {
+		console.log(`  · 重打 TUI 超宽行补丁: ${file}`);
+		try {
+			if (applyTuiPatch(file)) {
+				fixed.push("pi-tui 补丁");
+				console.log(`    ✓ 补丁已重打（原文件备份为 .bak）`);
+			} else {
+				console.log(`    ⚠ 补丁结构不匹配（import 行或 throw 行已变），未改动；请人工核对 ${file}`);
 			}
+		} catch (e) {
+			console.log(`    ✗ 打补丁失败: ${e.message}`);
 		}
 	}
 }

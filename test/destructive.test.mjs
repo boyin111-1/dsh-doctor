@@ -165,6 +165,9 @@ writeProfile(home, "redundant-insert", {
 }
 
 console.log("\n== D9: --fix 自动重链 file: 依赖（用假 pnpm shim 记录调用，应报重链成功）==");
+if (process.platform === "win32") {
+	console.log("  · Windows 无 POSIX sh/shim 执行环境，D9 --fix 重链用例自动跳过");
+} else {
 {
 	const fh = makeHome();
 	const target = mkdtempSync(join(tmpdir(), "dsh-fix-target-"));
@@ -192,6 +195,7 @@ console.log("\n== D9: --fix 自动重链 file: 依赖（用假 pnpm shim 记录�
 	rmSync(fh, { recursive: true, force: true });
 	rmSync(target, { recursive: true, force: true });
 	rmSync(bindir, { recursive: true, force: true });
+}
 }
 
 console.log("\n== D10: --session 悬空 tool_call 检测（#1544/#1363）==");
@@ -293,16 +297,17 @@ console.log("\n== GOOD: 健康 profile（应全绿，无误报）==");
 	console.log("\n== D12: 双模块实例检测（#1486：同版本独立副本=工具层崩溃；symlink/非组件=正常）==");
 	{
 		// 需要 PATH 里能解析到真实 dsh 安装。若本机无 dsh，FindDualInstances 内部降级跳过，
-		// 本用例自动跳过（不做无效断言）。
+		// 本用例自动跳过（不做无效断言）。Windows 用 `where`，POSIX 用 `command -v`。
+		const dshProbe = process.platform === "win32" ? "where dsh" : "command -v dsh";
 		const hasDsh = (() => {
-			try { const o = execSync("command -v dsh", { encoding: "utf-8" }).trim(); return o.length > 0; }
+			try { const o = execSync(dshProbe, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim(); return o.length > 0; }
 			catch { return false; }
 		})();
 		if (hasDsh) {
 			// 通过 dsh 的 realpath bin 定位安装根（.../@deepseek-ai/dsh）
 			let installRoot = null;
 			{
-				const bin = execSync("command -v dsh", { encoding: "utf-8" }).trim();
+				const bin = execSync(dshProbe, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim().split(/\r?\n/)[0];
 				let real = bin; try { real = realpathSync(bin); } catch {}
 				let d = dirname(real);
 				while (dirname(d) !== d) {
@@ -345,6 +350,48 @@ console.log("\n== GOOD: 健康 profile（应全绿，无误报）==");
 			console.log("  · 本机 PATH 无 dsh，双实例用例自动跳过");
 		}
 	}
+
+console.log("\n== T10: TUI 超宽行崩溃补丁（缺失检出 + --fix 重打）==");
+{
+	const th = makeHome();
+	const tuiFile = join(th, "profiles", "tui", "node_modules", "@earendil-works", "pi-tui", "dist", "tui-main-screen.js");
+	mkdirSync(dirname(tuiFile), { recursive: true });
+	writeFileSync(tuiFile,
+		'import { visibleWidth } from "./utils.js";\n' +
+		'function render() {\n' +
+		'  if (!isImage && visibleWidth(line) > width) {\n' +
+		'    throw new Error(errorMsg);\n' +
+		'  }\n' +
+		'}\n');
+	let { out } = runWith(doctor, [], { DSH_HOME: th });
+	assert(out.includes("TUI 超宽行崩溃补丁缺失"), "检出 pi-tui 补丁缺失", out.split("\n").filter((l) => l.includes("TUI")).join(" | "));
+	({ out } = runWith(doctor, ["--fix"], { DSH_HOME: th }));
+	const patched = readFileSync(tuiFile, "utf-8");
+	assert(patched.includes("truncateToWidth(line, width)") && !patched.includes("throw new Error(errorMsg);")
+		&& existsSync(tuiFile + ".bak"), "--fix 重打补丁（截断替代 throw + .bak 备份）", patched.split("\n")[0]);
+	assert(out.includes("补丁已重打"), "--fix 报告补丁已重打", out.split("\n").filter((l) => l.includes("补丁")).join(" | "));
+	({ out } = runWith(doctor, [], { DSH_HOME: th }));
+	assert(out.includes("TUI 超宽行补丁在位"), "补丁后不再报缺失", out.split("\n").filter((l) => l.includes("TUI")).join(" | "));
+	rmSync(th, { recursive: true, force: true });
+}
+
+console.log("\n== T11: toolkit-plugins 持久化插件源码（区分 .mjs 工具 / host.js 插件 / 空壳）==");
+{
+	const th = makeHome();
+	writeProfile(th, "web", {});
+	const tk = join(th, "profiles", "web", "toolkit-plugins");
+	mkdirSync(join(tk, "game-race"), { recursive: true });
+	writeFileSync(join(tk, "game-race", "host.js"), "return {}");
+	writeFileSync(join(tk, "game-race", "client.js"), "return {}");
+	mkdirSync(join(tk, "dev-kit"), { recursive: true });
+	writeFileSync(join(tk, "dev-kit", "index.mjs"), "export const apply = () => {}");
+	mkdirSync(join(tk, "empty-kit"), { recursive: true });
+	const { out } = runWith(doctor, [], { DSH_HOME: th });
+	assert(out.includes("持久化动态插件源码: game-race"), "识别 host.js/client.js 动态插件源码", out.split("\n").filter((l) => l.includes("game-race")).join(" | "));
+	assert(out.includes("全局工具插件: dev-kit"), "识别 index.mjs 全局工具", out.split("\n").filter((l) => l.includes("dev-kit")).join(" | "));
+	assert(out.includes("持久化插件目录异常: empty-kit"), "空壳目录告警", out.split("\n").filter((l) => l.includes("empty-kit")).join(" | "));
+	rmSync(th, { recursive: true, force: true });
+}
 
 // 清理临时 home
 rmSync(home, { recursive: true, force: true });

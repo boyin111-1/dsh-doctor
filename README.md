@@ -52,6 +52,8 @@ to vet a profile before switching to it.
 | 7 | Bundle ↔ user-patch id collision | a user `cordis.patch.yml` insert reuses a bundle's entry id → `duplicate loader entry id`; or a bundle is both in `dsh.profile.bundles` and inserted again by name (post-`reconcile` redundancy) | #1404, #1479 (advisory item a) |
 | 8 | Lockfile `file:` reference | `pnpm-lock.yaml` records a `file:` dep consistent with disk | #1197 |
 | 9 | Dangling `tool_call` (session) | a `tool/call` with no matching `tool/result` (by `message.source.callId`) in a completed turn → every later request rejected with `400 insufficient tool messages` | #1544, #1363 |
+| 10 | TUI over-wide-line crash patch | `pi-tui`'s `tui-main-screen.js` still throws (`throw new Error(errorMsg)`) on any rendered line wider than the terminal → kills the whole pi process; `--fix` re-applies the truncate patch (`.bak` backup) | runtime incident |
+| 11 | `toolkit-plugins` persistence | `.mjs` global tools (host-composed) vs `host.js`/`client.js` dynamic-plugin sources (the `plugin_deploy` recovery prerequisite); an empty kit dir warns | — |
 
 Checks 6 & 7 mirror `packages/boot/app-boot/src/profile.ts` `resolveBundleDir`
 (two-anchor: install package first, then profile dir) and the bundle-manifest
@@ -109,6 +111,54 @@ cp cordis.patch.yml cordis.patch.yml.bak   # then edit/remove the bad insert
 dsh-doctor never rewrites your live profile without `--fix` being explicit, and even
 then only touches broken `file:` links.
 
+## Runtime incident handbook
+
+The checks above are pre-boot. Some failures are **runtime** (dsh is up, but a
+page or process misbehaves); they are not boot-blockers, so no check gates on
+them. When they happen, here is the playbook — check 10/11 cover their durable
+state:
+
+### 1. TUI dies with `Rendered line N exceeds terminal width`
+
+`pi-tui` renders an over-wide line (e.g. a long Chinese line or a base64 blob in
+a tool result) and **throws, killing the whole pi process** — mid-turn, which
+also aborts the in-flight tool call. The fix replaces the throw with
+`truncateToWidth(line, width)`:
+
+```bash
+node dsh-doctor.mjs --fix        # detects the missing patch and re-applies it
+```
+
+or by hand: patch `profiles/tui/node_modules/@earendil-works/pi-tui/dist/tui-main-screen.js`
+(`throw new Error(errorMsg);` → `line = truncateToWidth(line, width);` and add
+`truncateToWidth` to the `./utils.js` import). A pi-tui upgrade overwrites the
+patch — re-run `--fix` after updates. The running process keeps the old code in
+memory, so restart pi after patching.
+
+### 2. A run card fails to render: `Cannot read properties of undefined (reading 'kind')`
+
+Browser-only render crash. After a service restart, stale dynamic-plugin Run
+cards in history re-project with incomplete node data (the plugin registry is
+process-memory), and the conversation renderer reads `node.xxx.kind` without a
+null guard. Harmless — session data is intact, the server is unaffected.
+**Refresh the page** (frontend state rebuilds, stale cards stop rendering), or
+start a new session if it recurs. Not a plugin bug; a frontend-robustness gap
+in the framework.
+
+### 3. Dynamic plugins vanish after a restart
+
+Dynamic Cordis plugins live in process memory — every restart clears them by
+design. Sources persisted under `profiles/<profile>/toolkit-plugins/<id>/`
+(check 11 verifies them) are re-deployed in one step:
+
+```
+plugin_deploy   id=<id>     # any session; reads host.js/client.js → define → run
+```
+
+First run of a client half asks for one UI approval; the grant persists for
+that version. Full static auto-load is not configurable here (client↔host
+communication requires Remote services whose capability set is compile-time).
+
 ## Tests
 
 `node test/destructive.test.mjs` builds throwaway profiles in a temp `$DSH_HOME`
@@ -118,8 +168,12 @@ one** — the no-false-positive guarantee behind the "real env is all green" che
 ```bash
 node --check dsh-doctor.mjs          # syntax
 node dsh-doctor.mjs                  # real ~/.dsh must be all green
-node test/destructive.test.mjs       # 12 destructive assertions (incl. --session orphan check)
+node test/destructive.test.mjs       # 20 assertions (D1-D12 + T10/T11, incl. --session orphan + TUI patch + toolkit-plugins)
 ```
+
+Cross-platform note: the suite runs on Windows too — POSIX-only cases
+(D9's shim, D12's `command -v`) auto-skip, and `verify-anchors` uses a pure-Node
+recursive scan instead of `grep`.
 
 ## Example
 

@@ -2,6 +2,33 @@
 
 All notable changes to dsh-doctor. Format follows [Keep a Changelog](https://keepachangelog.com/), versions match the npm `version` field.
 
+## [0.4.0] - 2026-08-15
+
+### Added
+- **Check 10: TUI 超宽行崩溃补丁完整性.** `@earendil-works/pi-tui` 在渲染超宽行时
+  `throw new Error(errorMsg)` 直接杀掉 pi 进程；本 check 检测 `tui-main-screen.js`
+  是否仍带该崩溃代码（升级覆盖补丁会被检出），`--fix` 可自动重打补丁
+  （截断替代崩溃，原文件备份 `.bak`）。
+- **Check 11: `toolkit-plugins` 持久化插件源码完整性.** 区分 `.mjs` 全局工具
+  （host 组合加载）与 `host.js`/`client.js` 动态插件源码（重启后 `plugin_deploy`
+  恢复的前提）；目录空壳会警告。
+- **README「运行时问题处理手册」.** 记录三类非启动问题的处理方法：TUI 超宽行
+  崩溃（刷新/`--fix` 重打补丁）、历史 run 卡片渲染崩溃
+  `Cannot read properties of undefined (reading 'kind')`（刷新页面/新会话）、
+  动态插件重启丢失（`plugin_deploy` 恢复）。
+
+### Fixed
+- **Windows 兼容：dsh 安装发现不再用 POSIX 命令.** `command -v dsh` → Windows 用
+  `where dsh`；glob 回退从 `ls -d ... | head -1` 改为纯 Node 目录展开
+  （`expandFirstGlob`），消除 Windows 下每次运行都喷的 `'command' is not
+  recognized` 噪音。
+- **`verify-anchors` 的源码扫描从 `grep` 改为纯 Node 递归**（`deepInspectContains`
+  + `globToRegExp`）——Windows 无 grep，此前锚点核对在 Windows 上永远全报缺失；
+  `lstatSync` 跳过符号链接与 grep -r 不跟随 symlink 的行为一致。
+- **测试套件 Windows 兼容**：D9（POSIX shim）与 D12（`command -v` 探测）在
+  Windows 自动跳过；新增 T10（TUI 补丁检出 + `--fix` 重打 + 备份 + 复检）与
+  T11（toolkit-plugins 的 .mjs 工具 / host.js 插件 / 空壳告警 区分）用例。
+
 ## [0.3.2] - 2026-08-15
 
 ### Fixed
