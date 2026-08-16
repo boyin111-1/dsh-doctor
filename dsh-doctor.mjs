@@ -18,12 +18,12 @@
  *   node dsh-doctor.mjs --verify-anchors <dshRepo>  # 核对检测锚点是否仍与官方源码一致
  *   node dsh-doctor.mjs --check-update      # 在线对比 npm registry 与本机 dsh 版本
  *   DSH_HOME=/path dsh-doctor.mjs  # 指定 Harness home（默认 ~/.dsh）
- *   node dsh-doctor.mjs 检查项 ≥18 类：悬空引用 / file:链接 / 重复id /
+ *   node dsh-doctor.mjs 检查项 ≥19 类：悬空引用 / file:链接 / 重复id /
  *      入口产物 / 双实例 / bundles完整性 / bundle-id碰撞 / bundle冗余insert /
  *      会话孤儿tool_call / TUI超宽行崩溃补丁 / toolkit-plugins持久化插件源码 /
  *      版本漂移(#1515) / 沙箱schannel TLS(#1789) / 会话seq完整性(#1497族) /
  *      skill frontmatter冒号(#1401) / 端口排除段(#1462) / PATH工具(#1270) /
- *      锚点基线(防漂移，自动)
+ *      锚点基线(防漂移，自动) / game-race自动恢复链路
  *
  * 防漂移设计（官方仓库改了 / 本地二进制更新了 / 本地与官方不一致）：
  *   - 每次运行自动 checkAnchorBaseline()：本机 dsh 版本 vs ANCHOR_BASELINE_VERSION，
@@ -1026,6 +1026,70 @@ function checkProfile(dir) {
 				report("⚠", `持久化插件目录异常: ${kit}（无 index.mjs / host.js / client.js，plugin_deploy 无法恢复）`);
 			}
 		}
+	}
+
+	// 10b. game-race 自动恢复链路（重启后自动出现的三要件）：
+	//      ① game-race/{host,client}.js 源码在位（plugin_deploy/bootstrap 读取源）；
+	//      ② game-race-bootstrap/index.mjs 在位（host 组合层引导插件）；
+	//      ③ cordis.patch.yml 引用了 bootstrap（组合层加载的前提）。
+	//      dsh 的动态插件是进程内存的（host-runner 明写 "lost on DSH restart"），
+	//      重启后只有 bootstrap 在组合层自动重新 define+run 才会自动出现。
+	checkGameRaceBootstrap(profileDir);
+}
+
+/**
+ * 检查 game-race 自动恢复链路（重启后弹窗是否会自动出现）。
+ *
+ * 背景：动态插件（cordis_define/run）定义在进程内存，dsh 重启即失。要"重启后
+ * 自动出现"，必须满足三要件：源码在 toolkit-plugins/game-race/、引导插件
+ * game-race-bootstrap/index.mjs 在位、且 cordis.patch.yml 引用它（组合层随
+ * dsh 启动加载引导插件，引导插件等首个 agent 后自动 define+run 恢复 game-race）。
+ *
+ * 已知限制（dsh 安全设计，无法绕过的部分会在报告里明示）：
+ *   - client 半批准是内存态，重启后弹窗 UI 仍需要在 Run 卡片点一次允许；
+ *   - 本检查只验证"链路是否齐备"，不能替代真实重启验证。
+ */
+function checkGameRaceBootstrap(profileDir) {
+	const tkDir = join(profileDir, "toolkit-plugins");
+	if (!existsSync(tkDir)) return;
+	const srcDir = join(tkDir, "game-race");
+	const bootDir = join(tkDir, "game-race-bootstrap");
+	const hasHost = existsSync(join(srcDir, "host.js"));
+	const hasClient = existsSync(join(srcDir, "client.js"));
+	const hasBoot = existsSync(join(bootDir, "index.mjs"));
+	if (!hasHost && !hasClient && !hasBoot) return; // 无 game-race 相关目录 → 不适用
+
+	// ① 源码
+	if (hasHost || hasClient) {
+		report("✓", `game-race 源码在位: host:${hasHost ? "有" : "无"} client:${hasClient ? "有" : "无"}（自动恢复的读取源）`);
+	} else {
+		report("✗", `game-race 源码缺失: ${srcDir} 下无 host.js/client.js（自动恢复无从读取）`);
+	}
+
+	// ② 引导插件
+	if (hasBoot) {
+		report("✓", `game-race 引导插件在位: game-race-bootstrap/index.mjs（启动时自动 define+run）`);
+	} else {
+		report("✗", `game-race 引导插件缺失: ${bootDir}/index.mjs 不存在（重启后不会自动恢复）`);
+	}
+
+	// ③ patch 引用
+	let patched = false;
+	try {
+		const patchSrc = readFileSync(join(profileDir, "cordis.patch.yml"), "utf-8");
+		patched = patchSrc.includes("game-race-bootstrap") && patchSrc.includes("game-race-bootstrap/index.mjs");
+	} catch { /* 无 patch 文件 */ }
+	if (patched) {
+		report("✓", `game-race 引导已挂载: cordis.patch.yml 引用了 game-race-bootstrap（组合层随启动加载）`);
+	} else if (hasBoot) {
+		report("✗", `game-race 引导未挂载: cordis.patch.yml 未引用 game-race-bootstrap（插件在位但不会自动执行）`);
+	}
+
+	// 总结
+	if (hasBoot && patched && (hasHost || hasClient)) {
+		report("✓", `game-race 自动恢复链路完整: 重启后引导插件将自动部署（client 半批准除外，见下）`);
+	} else {
+		report("⚠", `game-race 自动恢复链路不完整: 重启后不会自动出现，需手动 plugin_deploy 或修复上述缺失项`);
 	}
 }
 

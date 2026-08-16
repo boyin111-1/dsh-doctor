@@ -62,6 +62,7 @@ to vet a profile before switching to it.
 | 15 | Skill frontmatter colon trap | `SKILL.md` frontmatter whose unquoted `description` contains ASCII `": "` → YAML parses it as a nested mapping, the skill is silently dropped from the catalog (only a `logger.warn`); scans `~/.dsh/skills` and preset `skills/`, suggests quoting | #1401, #1450, #936 |
 | 16 | Windows excluded port range | parses `netsh interface ipv4 show excludedportrange protocol=tcp`; flags when dsh's default port 3080 falls inside a Hyper-V/WSL2/Docker reserved band (bind fails with EACCES even as admin) and suggests `--port` | #1462 |
 | 17 | PATH tool availability | `node`/`pnpm`/`npm`/`zstd` resolvable from PATH — missing `node` silently breaks new-session creation (`env: node: No such file or directory`), missing `pnpm` breaks plugin install | #1270, #1772 |
+| 18 | game-race auto-recovery chain | three prerequisites for the mini-game overlay to reappear after a dsh restart: source at `toolkit-plugins/game-race/{host,client}.js`, the `game-race-bootstrap/index.mjs` startup guide plugin, and its `cordis.patch.yml` reference (dynamic plugins are process-local — "lost on DSH restart" — so only the composition-layer guide can restore them); client-half approval remains a one-time per-restart click by design | — |
 
 Checks 6 & 7 mirror `packages/boot/app-boot/src/profile.ts` `resolveBundleDir`
 (two-anchor: install package first, then profile dir) and the bundle-manifest

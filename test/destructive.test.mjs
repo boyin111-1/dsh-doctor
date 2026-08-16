@@ -25,6 +25,7 @@
  *   T17 锚点基线防漂移（版本漂移自动核对：脱节/仍有效/一致三场景）
  *   T18 --check-update（在线对比 npm registry，网络不可用降级）
  *   T19 --fix 防漂移闸门（锚点脱节 fail-closed 中止 / --force 强制）
+ *   T20 game-race 自动恢复链路（bootstrap 三要件：源码/引导插件/patch 引用）
  */
 import { execFileSync, execSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync, existsSync, readdirSync } from "node:fs";
@@ -769,6 +770,46 @@ console.log("\n== T19: --fix 防漂移闸门（锚点脱节 → fail-closed 中�
 		assert(out.includes("补丁已重打") && readFileSync(tuiFile, "utf-8").includes("truncateToWidth(line, width)"), "脱节+--force：补丁执行并写入");
 		rmSync(h, { recursive: true, force: true });
 	}
+}
+
+console.log("\n== T20: game-race 自动恢复链路（bootstrap 三要件：源码/引导插件/patch 引用）==");
+{
+	// 构造：toolkit-plugins/game-race/{host,client}.js + game-race-bootstrap/index.mjs + patch 引用
+	const th = makeHome();
+	writeProfile(th, "web", {});
+	const tk = join(th, "profiles", "web", "toolkit-plugins");
+	mkdirSync(join(tk, "game-race"), { recursive: true });
+	writeFileSync(join(tk, "game-race", "host.js"), "return { apply() {} }");
+	writeFileSync(join(tk, "game-race", "client.js"), "return { apply() {} }");
+	mkdirSync(join(tk, "game-race-bootstrap"), { recursive: true });
+	writeFileSync(join(tk, "game-race-bootstrap", "index.mjs"), "export const apply = () => {}");
+	writeFileSync(join(th, "profiles", "web", "cordis.patch.yml"),
+		"- insert:\n    - id: game-race-bootstrap\n      name: './toolkit-plugins/game-race-bootstrap/index.mjs'\n");
+	let { out } = runWith(doctor, [], { DSH_HOME: th });
+	assert(out.includes("game-race 自动恢复链路完整"), "三要件齐全 → 链路完整", out.split("\n").filter((l) => l.includes("game-race")).join(" | "));
+	assert(out.includes("game-race 源码在位") && out.includes("引导插件在位") && out.includes("引导已挂载"), "三个要件分别报 ✓",
+		out.split("\n").filter((l) => l.includes("game-race")).join(" | "));
+	rmSync(th, { recursive: true, force: true });
+
+	// 缺 bootstrap → 报链路不完整
+	const th2 = makeHome();
+	writeProfile(th2, "web", {});
+	const tk2 = join(th2, "profiles", "web", "toolkit-plugins");
+	mkdirSync(join(tk2, "game-race"), { recursive: true });
+	writeFileSync(join(tk2, "game-race", "host.js"), "return { apply() {} }");
+	writeFileSync(join(tk2, "game-race", "client.js"), "return { apply() {} }");
+	writeFileSync(join(th2, "profiles", "web", "cordis.patch.yml"), "- insert:\n    - id: other\n      name: './toolkit-plugins/x/index.mjs'\n");
+	({ out } = runWith(doctor, [], { DSH_HOME: th2 }));
+	assert(out.includes("引导插件缺失") && out.includes("自动恢复链路不完整"), "缺引导插件 → 链路不完整",
+		out.split("\n").filter((l) => l.includes("game-race")).join(" | "));
+	rmSync(th2, { recursive: true, force: true });
+
+	// 无 game-race 目录 → 不适用（不误报）
+	const th3 = makeHome();
+	writeProfile(th3, "web", {});
+	({ out } = runWith(doctor, [], { DSH_HOME: th3 }));
+	assert(!out.includes("自动恢复链路"), "无 game-race → 不检查", out.split("\n").filter((l) => l.includes("自动恢复")).join(" | ") || "");
+	rmSync(th3, { recursive: true, force: true });
 }
 
 // 清理临时 home
